@@ -4,7 +4,6 @@ Export pytorch weights to fortran compatible matrices with ftorch
 
 import os
 import sys
-from pathlib import Path
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.append(project_root)
@@ -31,13 +30,16 @@ if __name__ == "__main__":
     deriv = model.dzdt
 
     # example input: 64 bins
-    example_x = torch.randn(64)
-    example_z = torch.randn(4)
-    example_l = torch.randn(3)
+    example_x = torch.randn(1, 64)
+    example_z = torch.randn(1, 4)
+    example_l = torch.randn(1, 4)
 
     traced_encoder = torch.jit.trace(enc, example_x)
-    traced_encoder.save("../data/ftorch_weights/nwi_encoder.pt")
+    traced_encoder.save("../../data/ftorch_weights/nwi_encoder.pt")
+    print("saved encoder")
     traced_decoder = torch.jit.trace(dec, example_l)
-    traced_decoder.save("../data/ftorch_weights/nwi_decoder.pt")
+    traced_decoder.save("../../data/ftorch_weights/nwi_decoder.pt")
+    print("saved decoder")
     traced_dzdt = torch.jit.trace(deriv, example_z)
-    traced_dzdt.save("../data/ftorch_weights/sed_dzdt.pt")
+    traced_dzdt.save("../../data/ftorch_weights/sed_dzdt.pt")
+    print("saved dzdt")

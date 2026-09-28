@@ -27,11 +27,11 @@ class ResBlock(nn.Module):
         super(ResBlock, self).__init__()
 
         self.stack = nn.Sequential(
-            nn.LayerNorm(num_features),
-            nn.LeakyReLU(),
+            #nn.LayerNorm(num_features),
+            nn.SiLU(),
             nn.Linear(num_features, num_features),
-            nn.LayerNorm(num_features),
-            nn.LeakyReLU(),
+            #nn.LayerNorm(num_features),
+            nn.SiLU(),
             nn.Linear(num_features, num_features),
         )
     def forward(self, x):
