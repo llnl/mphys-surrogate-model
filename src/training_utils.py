@@ -173,6 +173,65 @@ def setup_dataloaders_sed(data_src, params):
 
     return train_loader, test_loader, metadata
 
+
+def setup_dataloaders_cond(params, data):
+    """
+    Create data loaders for condensation models.
+
+    Args:
+        params: Parameters dict with batch_size
+        data: Dict from open_congestus_5400_dataset() containing train/test data
+
+    Returns:
+        train_loader, test_loader, metadata dict
+    """
+    # Create datasets
+    train_data = du.CondensationDataset(
+        data["x_train"],
+        data["dgdt_train"],
+        data["temp_train"],
+        data["sat_ratio_train"],
+        data["m_train"],
+    )
+
+    test_data = du.CondensationDataset(
+        data["x_test"],
+        data["dgdt_test"],
+        data["temp_test"],
+        data["sat_ratio_test"],
+        data["m_test"],
+    )
+
+    # Create data loaders
+    train_loader = DataLoader(
+        train_data, batch_size=params["batch_size"], shuffle=True
+    )
+    test_loader = DataLoader(
+        test_data, batch_size=len(test_data), shuffle=False
+    )
+
+    # Metadata for model creation and analysis
+    metadata = {
+        "n_bins": data["n_bins"],
+        "r_bins_edges": data["r_bins_edges"],
+        "rbin_median": data["rbin_median"],
+        "m_scale": data["m_scale"],
+        "cond_scale": data["cond_scale"],
+        "x_train": data["x_train"],
+        "m_train": data["m_train"],
+        "dgdt_train": data["dgdt_train"],
+        "temp_train": data["temp_train"],
+        "sat_ratio_train": data["sat_ratio_train"],
+        "x_test": data["x_test"],
+        "m_test": data["m_test"],
+        "dgdt_test": data["dgdt_test"],
+        "temp_test": data["temp_test"],
+        "sat_ratio_test": data["sat_ratio_test"],
+    }
+
+    return train_loader, test_loader, metadata
+
+
 def setup_loss_weights(params, train_data):
     """
     Set up loss weights based on dynamics type.
