@@ -134,6 +134,83 @@ def open_sed_datasets(path=None):
     return outputs
 
 
+def open_congestus_5400_dataset(test_size=0.2, random_state=1):
+    """
+    Open congestus 5400s filtered 100m dataset for condensation modeling.
+
+    This dataset contains:
+    - dmdlnr: Mass distribution (kg/m³/ln(R))
+    - dgdt_cond: Condensation tendency from ERF (kg/m³/s/ln(R))
+    - temp: Temperature (K)
+    - sat_ratio: Saturation ratio (dimensionless)
+    - rh: Relative humidity (dimensionless)
+
+    Args:
+        test_size: Fraction of data to use for testing (default 0.2)
+        random_state: Random seed for train/test split (default 1)
+
+    Returns:
+        Dictionary with train/test splits and metadata
+    """
+    # Load dataset
+    dpath = Path(__file__).parent.parent / "data" / "erf_data" / "congestus"
+    ds = xr.open_dataset(dpath / "5400_filtered_100m.nc")
+
+    # Split into train/test
+    ds_train, train_idx, ds_test, test_idx = split_by_index(ds, "loc", test_size, random_state)
+
+    # Extract and compute scales from training data
+    # DSD mass scale
+    m_train = ds_train["dmdlnr"].sum(dim="bin")
+    m_scale = m_train.max().item()
+
+    # Condensation tendency scale
+    dgdt_train_raw = ds_train["dgdt_cond"]
+    cond_scale = np.abs(dgdt_train_raw).max().item()
+
+    # Prepare training data
+    x_train = ds_train["dmdlnr"].transpose("loc", "t", "bin").to_numpy()[:, 0, :] / m_scale
+    m_train = m_train.transpose("loc", "t").to_numpy()[:, 0] / m_scale
+    dgdt_train = dgdt_train_raw.transpose("loc", "t", "bin").to_numpy()[:, 0, :] / cond_scale
+    temp_train = ds_train["temp"].transpose("loc", "t").to_numpy()[:, 0]
+    sat_ratio_train = ds_train["sat_ratio"].transpose("loc", "t").to_numpy()[:, 0]
+
+    # Prepare test data
+    m_test = ds_test["dmdlnr"].sum(dim="bin")
+    x_test = ds_test["dmdlnr"].transpose("loc", "t", "bin").to_numpy()[:, 0, :] / m_scale
+    m_test = m_test.transpose("loc", "t").to_numpy()[:, 0] / m_scale
+    dgdt_test = ds_test["dgdt_cond"].transpose("loc", "t", "bin").to_numpy()[:, 0, :] / cond_scale
+    temp_test = ds_test["temp"].transpose("loc", "t").to_numpy()[:, 0]
+    sat_ratio_test = ds_test["sat_ratio"].transpose("loc", "t").to_numpy()[:, 0]
+
+    # Bin information
+    r_bins_edges = ds["rbin_l"].to_numpy()
+    r_bins_edges_r = ds["rbin_r"].to_numpy()
+    rbin_median = r_bins_edges_r  # Use right edge as representative radius
+    n_bins = x_train.shape[-1]
+
+    outputs = {
+        "x_train": x_train,  # [n_train, n_bins]
+        "m_train": m_train,  # [n_train]
+        "dgdt_train": dgdt_train,  # [n_train, n_bins]
+        "temp_train": temp_train,  # [n_train]
+        "sat_ratio_train": sat_ratio_train,  # [n_train]
+        "x_test": x_test,  # [n_test, n_bins]
+        "m_test": m_test,  # [n_test]
+        "dgdt_test": dgdt_test,  # [n_test, n_bins]
+        "temp_test": temp_test,  # [n_test]
+        "sat_ratio_test": sat_ratio_test,  # [n_test]
+        "r_bins_edges": r_bins_edges,  # [n_bins]
+        "r_bins_edges_r": r_bins_edges_r,  # [n_bins]
+        "rbin_median": rbin_median,  # [n_bins]
+        "n_bins": n_bins,  # 64
+        "m_scale": m_scale,
+        "cond_scale": cond_scale,
+    }
+
+    return outputs
+
+
 def split_by_index(ds: xr.Dataset, dim: str, test_size: float, random_state: int = 0):
     """
     Splits a Dataset along one integer dimension into train/test.
@@ -586,6 +663,38 @@ class BinDatasetSed(Dataset):
 
     def __getitem__(self, idx):
         return self.x[idx, :], self.flux[idx, :], self.M[idx]
+
+
+class CondensationDataset(Dataset):
+    def __init__(self, x, dgdt, temp, sat_ratio, m):
+        """
+        Dataset for condensation tendency prediction.
+
+        Args:
+            x: Normalized DSD data (shape: [n_samples, n_bins])
+            dgdt: Condensation tendency data (shape: [n_samples, n_bins])
+            temp: Temperature data (shape: [n_samples])
+            sat_ratio: Saturation ratio data (shape: [n_samples])
+            m: Total mass (shape: [n_samples])
+        """
+        self.nbin = x.shape[1]
+        self.x = x.reshape(-1, 1, self.nbin).astype(np.float32)
+        self.dgdt = dgdt.reshape(-1, 1, self.nbin).astype(np.float32)
+        self.temp = temp.reshape(-1, 1, 1).astype(np.float32)
+        self.sat_ratio = sat_ratio.reshape(-1, 1, 1).astype(np.float32)
+        self.M = m.reshape(-1, 1, 1).astype(np.float32)
+
+    def __len__(self):
+        return int(self.x.shape[0])
+
+    def __getitem__(self, idx):
+        return (
+            self.x[idx, :],
+            self.dgdt[idx, :],
+            self.temp[idx, :],
+            self.sat_ratio[idx, :],
+            self.M[idx]
+        )
 
 
 def sindy_library_tensor(z, latent_dim, poly_order):
