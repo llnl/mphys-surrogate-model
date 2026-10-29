@@ -59,6 +59,9 @@ def G_func(T, R):
     """
     Compute growth coefficient G with Knudsen corrections.
 
+    Pure torch when either input is a tensor (traceable/exportable and
+    differentiable w.r.t. T); pure numpy otherwise.
+
     Args:
         T: Temperature [batch, 1, 1] in Kelvin (torch tensor or numpy array)
         R: Droplet radius [1, 1, n_bins] in meters (torch tensor or numpy array)
@@ -66,17 +69,13 @@ def G_func(T, R):
     Returns:
         G: Growth coefficient [batch, 1, n_bins] in m²/s
     """
-    is_numpy = isinstance(T, np.ndarray)
-
-    if is_numpy:
-        sqrt = np.sqrt
-        pi = np.pi
-    else:
-        sqrt = torch.sqrt
-        pi = np.pi
+    use_torch = torch.is_tensor(T) or torch.is_tensor(R)
+    sqrt = torch.sqrt if use_torch else np.sqrt
+    if use_torch and not torch.is_tensor(T):
+        T = torch.as_tensor(T, dtype=R.dtype, device=R.device)
 
     # Mean free path of vapor molecules
-    lambda_v = 2 * D_v / sqrt(8 * T * Rv / pi)
+    lambda_v = 2 * D_v / sqrt(8 * T * Rv / np.pi)
 
     # Knudsen number
     Kn = lambda_v / R
@@ -87,15 +86,10 @@ def G_func(T, R):
     # Thermal factor F_k
     F_k = (L_v / Rv / T - 1) * L_v * rho_l / K / T
 
-    # Saturation vapor pressure (convert T from K to °C)
-    if is_numpy:
-        es_T = get_esat(T - 273.16)
-    else:
-        # For torch tensors, convert to numpy for esat computation
-        es_T_np = get_esat((T - 273.16).cpu().numpy())
-        es_T = torch.from_numpy(es_T_np).to(T.device)
-
-    es_T = es_T * 100  # Convert from hPa to Pa
+    # Saturation vapor pressure (polynomial in °C; works for tensors and arrays).
+    # Previously this round-tripped through numpy for tensors, which detached T
+    # from autograd and made torch.jit.trace bake in the example T as a constant.
+    es_T = get_esat(T - 273.16) * 100  # hPa -> Pa
 
     # Diffusion factor F_d
     F_d = rho_l * Rv * T / (dcf * D_v * es_T)
@@ -134,40 +128,103 @@ def drdt(R, T, S, use_kohler=False):
     return drdt
 
 
-def compute_theoretical_condensation(g, T, S, rbin_median, use_kohler=False):
+def bin_faces_from_centers(rbin_median):
     """
-    Compute theoretical condensation tendency dg/dt from reconstructed DSD.
-
-    The condensation tendency is computed as:
-        dg/dt = 3 * g * (dr/dt) / r
-
-    where dr/dt is the droplet radius growth rate from Köhler theory.
+    Bin edges (faces) for log-uniform bins, reconstructed from geometric centers.
 
     Args:
-        g: Reconstructed DSD [batch, 1, n_bins] in kg/m³/ln(R)
+        rbin_median: Geometric bin centers [n_bins] (or any shape ending in n_bins)
+
+    Returns:
+        (r_faces [n_bins + 1], dlnr) in the same array type as the input
+    """
+    rc = rbin_median.reshape(-1)
+    if torch.is_tensor(rc):
+        dlnr = torch.log(rc[1] / rc[0])
+        faces = torch.cat([rc[:1] * torch.exp(-dlnr / 2), rc * torch.exp(dlnr / 2)])
+    else:
+        dlnr = np.log(rc[1] / rc[0])
+        faces = np.concatenate([rc[:1] * np.exp(-dlnr / 2), rc * np.exp(dlnr / 2)])
+    return faces, dlnr
+
+
+def condensation_tendency_fv(g, v_center, v_face, dlnr, scheme="central"):
+    """
+    Finite-volume condensation tendency of a mass density g(ln r):
+
+        dg/dt = -d(v g)/d(ln r) + 3 v g,     v = (dr/dt) / r = d(ln r)/dt
+
+    The first term moves mass between bins (shape change); the second is the
+    mass gain from growth (m ∝ r^3) and is the only term that changes total mass.
+    Boundary fluxes at the smallest/largest faces are zero, consistent with the
+    integration by parts behind compute_nwi_prefactor.
+
+    Args:
+        g: [..., n_bins] mass density per ln r
+        v_center: [..., n_bins] d(ln r)/dt at bin centers (for the 3 v g term)
+        v_face: [..., n_bins + 1] d(ln r)/dt at bin faces (for the flux term)
+        dlnr: bin width in ln r (uniform)
+        scheme: "central" (second order, matches the latent projection to O(dlnr^2))
+                or "upwind" (first order, monotone)
+
+    Returns:
+        dgdt: [..., n_bins]
+    """
+    is_t = torch.is_tensor(g)
+    vf = v_face[..., 1:-1]
+    if scheme == "central":
+        g_face = 0.5 * (g[..., :-1] + g[..., 1:])
+    elif scheme == "upwind":
+        g_face = torch.where(vf > 0, g[..., :-1], g[..., 1:]) if is_t else np.where(vf > 0, g[..., :-1], g[..., 1:])
+    else:
+        raise ValueError(f"Unknown scheme: {scheme}")
+    F_int = vf * g_face
+    if is_t:
+        zero = torch.zeros_like(F_int[..., :1])
+        F = torch.cat([zero, F_int, zero], dim=-1)
+    else:
+        zero = np.zeros_like(F_int[..., :1])
+        F = np.concatenate([zero, F_int, zero], axis=-1)
+    return -(F[..., 1:] - F[..., :-1]) / dlnr + 3 * v_center * g
+
+
+def compute_theoretical_condensation(g, T, S, rbin_median, use_kohler=False, r_faces=None,
+                                     scheme="central"):
+    """
+    Compute theoretical condensation tendency dg/dt from a binned DSD.
+
+    Solves the full mass-density growth equation in ln r space,
+
+        dg/dt = -d(v g)/d(ln r) + 3 v g,   v = (dr/dt) / r,
+
+    with a conservative finite-volume discretization (see condensation_tendency_fv).
+    The previous version returned only the 3 v g term, which gets the total mass
+    tendency right but omits the redistribution of mass across bins.
+
+    Args:
+        g: DSD [batch, 1, n_bins] in kg/m³/ln(R)
         T: Temperature [batch, 1, 1] in Kelvin
         S: Saturation ratio [batch, 1, 1] (dimensionless)
-        rbin_median: Median bin radii [1, 1, n_bins] in meters (torch tensor or numpy array)
+        rbin_median: Geometric bin centers [n_bins] or [1, 1, n_bins] in meters
         use_kohler: If True, include Köhler theory corrections
+        r_faces: Optional bin edges [n_bins + 1]; reconstructed from
+            rbin_median (assumed log-uniform centers) if not given
+        scheme: Face interpolation, "central" or "upwind"
 
     Returns:
         dgdt: Condensation tendency [batch, 1, n_bins] in kg/m³/s/ln(R)
     """
-    # Ensure rbin_median has the right shape
-    if len(rbin_median.shape) == 1:
-        # Reshape from [n_bins] to [1, 1, n_bins]
-        if isinstance(rbin_median, np.ndarray):
-            rbin_median = rbin_median.reshape(1, 1, -1)
-        else:
-            rbin_median = rbin_median.reshape(1, 1, -1)
+    faces, dlnr = bin_faces_from_centers(rbin_median)
+    if r_faces is not None:
+        faces = r_faces.reshape(-1)
+    lead = (1,) * (g.ndim - 1)
+    rc = rbin_median.reshape(lead + (-1,))
+    rf = faces.reshape(lead + (-1,))
 
-    # Compute dr/dt
-    drdt_val = drdt(rbin_median, T, S, use_kohler=use_kohler)
+    v_center = drdt(rc, T, S, use_kohler=use_kohler) / rc
+    v_face = drdt(rf, T, S, use_kohler=use_kohler) / rf
 
-    # Compute dg/dt = 3 * g * (dr/dt) / r
-    dgdt = 3 * g * drdt_val / rbin_median
-
-    return dgdt
+    return condensation_tendency_fv(g, v_center, v_face, dlnr, scheme=scheme)
 
 
 def compute_projected_condensation(dhdt, Z, decoder):

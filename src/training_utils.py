@@ -215,6 +215,7 @@ def setup_dataloaders_cond(params, data):
         "n_bins": data["n_bins"],
         "r_bins_edges": data["r_bins_edges"],
         "rbin_median": data["rbin_median"],
+        "rbin_eval": data.get("rbin_eval", "right"),
         "m_scale": data["m_scale"],
         "cond_scale": data["cond_scale"],
         "x_train": data["x_train"],

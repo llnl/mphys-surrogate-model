@@ -186,7 +186,9 @@ def open_congestus_5400_dataset(test_size=0.2, random_state=1):
     # Bin information
     r_bins_edges = ds["rbin_l"].to_numpy()
     r_bins_edges_r = ds["rbin_r"].to_numpy()
-    rbin_median = r_bins_edges_r  # Use right edge as representative radius
+    # Geometric bin center as representative radius for v_cond = G (S - 1) / r^2.
+    # (Previously the right edge, which biases v_cond low by exp(-dlnr) ~ 0.875.)
+    rbin_median = np.sqrt(r_bins_edges * r_bins_edges_r)
     n_bins = x_train.shape[-1]
 
     outputs = {
@@ -202,7 +204,8 @@ def open_congestus_5400_dataset(test_size=0.2, random_state=1):
         "sat_ratio_test": sat_ratio_test,  # [n_test]
         "r_bins_edges": r_bins_edges,  # [n_bins]
         "r_bins_edges_r": r_bins_edges_r,  # [n_bins]
-        "rbin_median": rbin_median,  # [n_bins]
+        "rbin_median": rbin_median,  # [n_bins] geometric centers
+        "rbin_eval": "center",  # recorded in params.json so checkpoints know which radius was used
         "n_bins": n_bins,  # 64
         "m_scale": m_scale,
         "cond_scale": cond_scale,

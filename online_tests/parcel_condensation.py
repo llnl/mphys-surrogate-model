@@ -94,7 +94,7 @@ class BinGrid:
     """Log-uniform radius bins. ``r_eval`` is where v_cond is evaluated."""
 
     edges: np.ndarray  # [N+1], m
-    r_eval_choice: str = "right"  # "right" matches training (rbin_median = rbin_r)
+    r_eval_choice: str = "center"  # match the training convention (params["rbin_eval"])
 
     def __post_init__(self):
         self.edges = np.asarray(self.edges, dtype=float)
@@ -117,8 +117,16 @@ class BinGrid:
         return len(self.edges) - 1
 
     @classmethod
-    def log_uniform(cls, n_bins=64, r_min=1e-6, r_max=5e-3, r_eval_choice="right"):
+    def log_uniform(cls, n_bins=64, r_min=1e-6, r_max=5e-3, r_eval_choice="center"):
         return cls(np.geomspace(r_min, r_max, n_bins + 1), r_eval_choice)
+
+    @classmethod
+    def from_centers(cls, r_center, r_eval_choice="center"):
+        """Rebuild edges from geometric centers (rbin_eval == "center")."""
+        r_center = np.asarray(r_center, dtype=float)
+        dl = np.log(r_center[1] / r_center[0])
+        edges = np.concatenate([[r_center[0] * np.exp(-dl / 2)], r_center * np.exp(dl / 2)])
+        return cls(edges, r_eval_choice)
 
     @classmethod
     def from_right_edges(cls, r_right, r_eval_choice="right"):
@@ -129,7 +137,7 @@ class BinGrid:
         return cls(edges, r_eval_choice)
 
     @classmethod
-    def from_dataset(cls, path, r_eval_choice="right"):
+    def from_dataset(cls, path, r_eval_choice="center"):
         import xarray as xr
 
         ds = xr.open_dataset(path)
@@ -538,8 +546,12 @@ def plot_comparison(op, rom, ref, cmp, path=None, spectra_times=None):
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
-def load_from_checkpoint(model_dir, r_eval_choice="right", prefactor="autograd", **kw):
-    """Training-run directory with params.json and a single .pth."""
+def load_from_checkpoint(model_dir, r_eval_choice=None, prefactor="autograd", **kw):
+    """Training-run directory with params.json and a single .pth.
+
+    r_eval_choice=None uses the radius convention the model was trained with:
+    params["rbin_eval"] ("center"), or "right" for checkpoints that predate it.
+    """
     model_dir = Path(model_dir)
     params = json.loads((model_dir / "params.json").read_text())
     pths = sorted(model_dir.glob("*.pth"))
@@ -549,8 +561,11 @@ def load_from_checkpoint(model_dir, r_eval_choice="right", prefactor="autograd",
     model = model_factory.create_model(params["encoder_type"], params["decoder_type"],
                                        params.get("dynamics_type", "none"), params, n_bins)
     model.load_state_dict(torch.load(pths[0], map_location="cpu"))
+    trained_eval = params.get("rbin_eval", "right")
+    r_eval_choice = r_eval_choice or trained_eval
     if "rbin_median" in params:
-        grid = BinGrid.from_right_edges(params["rbin_median"], r_eval_choice)
+        build = BinGrid.from_centers if trained_eval == "center" else BinGrid.from_right_edges
+        grid = build(params["rbin_median"], r_eval_choice)
     else:
         grid = BinGrid.log_uniform(n_bins, r_eval_choice=r_eval_choice)
     return LatentCondensation(model.encoder, model.decoder, grid,
@@ -573,7 +588,8 @@ def main(argv=None):
     ap.add_argument("--decoder-ts")
     ap.add_argument("--m-scale", type=float, default=1.0)
     ap.add_argument("--bins-file", help="netCDF with rbin_l/rbin_r (else params.json or 1um-5mm)")
-    ap.add_argument("--r-eval", choices=["right", "center"], default="right")
+    ap.add_argument("--r-eval", choices=["right", "center"], default=None,
+                    help="radius for v_cond (default: training convention; 'center' for TorchScript)")
     ap.add_argument("--prefactor", choices=["autograd", "fd"], default=None)
     ap.add_argument("--fd-grid", choices=["encoder", "bins"], default="encoder")
     ap.add_argument("--mode", choices=["parcel", "box"], default="parcel",
@@ -599,10 +615,11 @@ def main(argv=None):
         op = load_from_checkpoint(args.model_dir, args.r_eval, args.prefactor or "autograd",
                                   fd_grid=args.fd_grid)
         if args.bins_file:
-            op.grid = BinGrid.from_dataset(args.bins_file, args.r_eval)
+            op.grid = BinGrid.from_dataset(args.bins_file, args.r_eval or op.grid.r_eval_choice)
     else:
-        grid = (BinGrid.from_dataset(args.bins_file, args.r_eval) if args.bins_file
-                else BinGrid.log_uniform(r_eval_choice=args.r_eval))
+        r_eval = args.r_eval or "center"
+        grid = (BinGrid.from_dataset(args.bins_file, r_eval) if args.bins_file
+                else BinGrid.log_uniform(r_eval_choice=r_eval))
         op = load_from_torchscript(args.encoder_ts, args.decoder_ts, grid, args.m_scale,
                                    fd_grid=args.fd_grid)
 

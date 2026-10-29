@@ -106,6 +106,7 @@ if __name__ == "__main__":
 
     # Add physical parameters to params for loss functions
     params["rbin_median"] = metadata["rbin_median"]
+    params["rbin_eval"] = metadata["rbin_eval"]
     params["m_scale"] = metadata["m_scale"]
     params["cond_scale"] = metadata["cond_scale"]
 
