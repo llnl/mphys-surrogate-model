@@ -34,7 +34,8 @@ params = {
     "hidden_size": 128,
 
     # Data
-    "data_src": "congestus_5400",
+    "data_src": "congestus_5400_200m",
+    "data_file": "5400_filtered_200m.nc",  # smoother spectra than the 100m file
     "test_size": 0.2,
 
     # Training
@@ -52,7 +53,12 @@ params = {
 
     # Loss parameters
     "tol": 1e-8,
-    "cond_loss_type": "erf",  # "erf", "theory", or "none" (pure autoencoder)
+    "cond_loss_type": "theory",  # "erf", "theory", or "none" (pure autoencoder)
+    # Target the projected tendency is compared against:
+    #   "eulerian"   bin tendency dg/dt = -d(vg)/dlnr + 3vg, consistent with compute_dhdt
+    #   "lagrangian" 3vg / ERF dgdt_cond as-is (previous behaviour; inconsistent with compute_dhdt)
+    "cond_target": "eulerian",
+    "cond_theory_scheme": "central",  # FV scheme for the eulerian theory target
 
     # Loss weights for condensation-aware autoencoder
     # - loss_weight_recon: DSD reconstruction (KL divergence)
@@ -82,7 +88,8 @@ if __name__ == "__main__":
     print("\nLoading condensation dataset...")
     data = data_utils.open_congestus_5400_dataset(
         test_size=params["test_size"],
-        random_state=params["random_seed"]
+        random_state=params["random_seed"],
+        filename=params["data_file"],
     )
     print(f"Training samples: {data['x_train'].shape[0]}")
     print(f"Test samples: {data['x_test'].shape[0]}")

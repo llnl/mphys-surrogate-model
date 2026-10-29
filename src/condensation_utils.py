@@ -164,8 +164,11 @@ def condensation_tendency_fv(g, v_center, v_face, dlnr, scheme="central"):
         v_center: [..., n_bins] d(ln r)/dt at bin centers (for the 3 v g term)
         v_face: [..., n_bins + 1] d(ln r)/dt at bin faces (for the flux term)
         dlnr: bin width in ln r (uniform)
-        scheme: "central" (second order, matches the latent projection to O(dlnr^2))
-                or "upwind" (first order, monotone)
+        scheme: "central" (default; second order for smooth g, and the form whose
+                encoding matches the latent projection P (v g)) or "upwind" (first
+                order, monotone). Use "upwind" for *time integration* of g: central
+                produces negative tendencies in empty bins next to spikes and blows
+                up under strong evaporation.
 
     Returns:
         dgdt: [..., n_bins]
@@ -188,18 +191,69 @@ def condensation_tendency_fv(g, v_center, v_face, dlnr, scheme="central"):
     return -(F[..., 1:] - F[..., :-1]) / dlnr + 3 * v_center * g
 
 
-def compute_theoretical_condensation(g, T, S, rbin_median, use_kohler=False, r_faces=None,
-                                     scheme="central"):
+def eulerian_from_lagrangian(dgdt_lag, dlnr, scheme="central"):
     """
-    Compute theoretical condensation tendency dg/dt from a binned DSD.
+    Convert a per-bin *Lagrangian* condensation tendency into the *Eulerian* bin
+    tendency dg/dt.
 
-    Solves the full mass-density growth equation in ln r space,
+    ERF's dgdt_cond is the mass-gain rate of the droplets that are currently in
+    each bin, sum_{p in bin i} dm_p/dt / dlnr = 3 (v g)_i. It does not include
+    droplets crossing bin edges. The Eulerian tendency (what the latent state
+    h = Enc(g) actually feels) adds that flux:
 
-        dg/dt = -d(v g)/d(ln r) + 3 v g,   v = (dr/dt) / r,
+        dg/dt = -d(v g)/d(ln r) + 3 v g,   with (v g)_i = dgdt_lag_i / 3
 
-    with a conservative finite-volume discretization (see condensation_tendency_fv).
-    The previous version returned only the 3 v g term, which gets the total mass
-    tendency right but omits the redistribution of mass across bins.
+    No representative radius is needed: (v g)_i comes straight from the data.
+
+    Args:
+        dgdt_lag: [..., n_bins] Lagrangian per-bin tendency (e.g. ERF dgdt_cond)
+        dlnr: bin width in ln r
+        scheme: face value of (v g): "central" (default; Enc of the result equals
+            P (dgdt_lag / 3) to second order, so it is the consistent training target)
+            or "upwind" (donor cell; monotone, use for time integration)
+
+    Returns:
+        dgdt_euler: [..., n_bins]
+    """
+    vg = dgdt_lag / 3
+    is_t = torch.is_tensor(vg)
+    if scheme == "central":
+        F_int = 0.5 * (vg[..., :-1] + vg[..., 1:])
+    elif scheme == "upwind":
+        # direction from the sign of v, which is uniform within a cell (sign of S - 1
+        # without Kohler); vg alone is 0 in empty bins, so use the pair sum
+        up = (vg[..., :-1] + vg[..., 1:]) > 0
+        F_int = torch.where(up, vg[..., :-1], vg[..., 1:]) if is_t else np.where(up, vg[..., :-1], vg[..., 1:])
+    else:
+        raise ValueError(f"Unknown scheme: {scheme}")
+    if is_t:
+        zero = torch.zeros_like(F_int[..., :1])
+        F = torch.cat([zero, F_int, zero], dim=-1)
+    else:
+        zero = np.zeros_like(F_int[..., :1])
+        F = np.concatenate([zero, F_int, zero], axis=-1)
+    return -(F[..., 1:] - F[..., :-1]) / dlnr + dgdt_lag
+
+
+def compute_theoretical_condensation(g, T, S, rbin_median, use_kohler=False, r_faces=None,
+                                     form="lagrangian", scheme="central"):
+    """
+    Theoretical condensation tendency from a binned DSD.
+
+    Two different quantities, both called "dg/dt" in practice:
+
+    form="lagrangian" (default)
+        3 v g: mass-gain rate of the droplets currently in each bin. This is how
+        ERF's dgdt_cond is defined, so use it when comparing against that data.
+        It has the right total mass tendency but no transfer between bins, so
+        integrating it in time grows each bin in place.
+
+    form="eulerian"
+        -d(v g)/d(ln r) + 3 v g: the rate of change of the binned DSD itself.
+        This is what h = Enc(g) evolves with (compute_dhdt is its projection),
+        and what a time integration of g needs.
+
+    Here v = (dr/dt) / r = d(ln r)/dt.
 
     Args:
         g: DSD [batch, 1, n_bins] in kg/m³/ln(R)
@@ -207,23 +261,28 @@ def compute_theoretical_condensation(g, T, S, rbin_median, use_kohler=False, r_f
         S: Saturation ratio [batch, 1, 1] (dimensionless)
         rbin_median: Geometric bin centers [n_bins] or [1, 1, n_bins] in meters
         use_kohler: If True, include Köhler theory corrections
-        r_faces: Optional bin edges [n_bins + 1]; reconstructed from
-            rbin_median (assumed log-uniform centers) if not given
-        scheme: Face interpolation, "central" or "upwind"
+        r_faces: Optional bin edges [n_bins + 1] (eulerian form); reconstructed
+            from rbin_median (assumed log-uniform centers) if not given
+        form: "lagrangian" or "eulerian"
+        scheme: face interpolation for the eulerian form, "central" (default) or
+            "upwind" (use for time integration; see condensation_tendency_fv)
 
     Returns:
         dgdt: Condensation tendency [batch, 1, n_bins] in kg/m³/s/ln(R)
     """
+    lead = (1,) * (g.ndim - 1)
+    rc = rbin_median.reshape(lead + (-1,))
+    v_center = drdt(rc, T, S, use_kohler=use_kohler) / rc
+    if form == "lagrangian":
+        return 3 * v_center * g
+    if form != "eulerian":
+        raise ValueError(f"Unknown form: {form}")
+
     faces, dlnr = bin_faces_from_centers(rbin_median)
     if r_faces is not None:
         faces = r_faces.reshape(-1)
-    lead = (1,) * (g.ndim - 1)
-    rc = rbin_median.reshape(lead + (-1,))
     rf = faces.reshape(lead + (-1,))
-
-    v_center = drdt(rc, T, S, use_kohler=use_kohler) / rc
     v_face = drdt(rf, T, S, use_kohler=use_kohler) / rf
-
     return condensation_tendency_fv(g, v_center, v_face, dlnr, scheme=scheme)
 
 

@@ -5,7 +5,21 @@ Provides loss computation for different dynamics types and condensation targets 
 
 import torch
 
-from src.condensation_utils import compute_theoretical_condensation, compute_dhdt
+from src.condensation_utils import (
+    compute_dhdt,
+    compute_theoretical_condensation,
+    eulerian_from_lagrangian,
+)
+
+
+def _cond_target_form(params):
+    """'eulerian' (default): compare the projected latent tendency against the
+    Eulerian bin tendency, which is what compute_dhdt represents.
+    'lagrangian': previous behaviour, compares against ERF's per-bin mass gain."""
+    form = params.get("cond_target", "eulerian")
+    if form not in ("eulerian", "lagrangian"):
+        raise ValueError(f"cond_target must be 'eulerian' or 'lagrangian', got {form}")
+    return form
 
 # Global loss functions
 mse = torch.nn.MSELoss()
@@ -67,7 +81,12 @@ def compute_condensation_loss_erf(model, batch, params, device):
     cond_scale = params["cond_scale"]
     dgdt_proj_scaled = dgdt_proj * m_scale / cond_scale
 
-    # 6. Condensation tendency loss (projected vs ERF ground truth, both scaled by cond_scale)
+    # 6. Condensation tendency loss (projected vs ERF ground truth, both scaled by cond_scale).
+    # ERF's dgdt_cond is Lagrangian (mass gain of droplets in each bin); the projected
+    # tendency is Eulerian, so convert the target unless the old behaviour is requested.
+    if _cond_target_form(params) == "eulerian":
+        dlnr = float(torch.log(rbin_median[..., 1] / rbin_median[..., 0]).reshape(-1)[0])
+        batch_dgdt = eulerian_from_lagrangian(batch_dgdt, dlnr)
     loss_cond_dx = mse(dgdt_proj_scaled, batch_dgdt)
 
     # Weighted total loss
@@ -137,7 +156,9 @@ def compute_condensation_loss_theory(model, batch, params, device):
 
     # 5. Compute the theoretical rate of condensation in scaled mass units
     dgdt_theory = compute_theoretical_condensation(
-        pred_x_recon, batch_temp, batch_sat, rbin_median, use_kohler=False
+        pred_x_recon, batch_temp, batch_sat, rbin_median, use_kohler=False,
+        form=_cond_target_form(params),
+        scheme=params.get("cond_theory_scheme", "central"),  # decoder output is smooth
     )
 
     # 6. Condensation tendency loss: projected vs theoretical with scaled mass units 

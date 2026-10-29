@@ -134,7 +134,7 @@ def open_sed_datasets(path=None):
     return outputs
 
 
-def open_congestus_5400_dataset(test_size=0.2, random_state=1):
+def open_congestus_5400_dataset(test_size=0.2, random_state=1, filename="5400_filtered_100m.nc"):
     """
     Open congestus 5400s filtered 100m dataset for condensation modeling.
 
@@ -148,13 +148,15 @@ def open_congestus_5400_dataset(test_size=0.2, random_state=1):
     Args:
         test_size: Fraction of data to use for testing (default 0.2)
         random_state: Random seed for train/test split (default 1)
+        filename: File in data/erf_data/congestus, e.g. "5400_filtered_200m.nc"
+            (smoother spectra; preferable for the theory loss)
 
     Returns:
         Dictionary with train/test splits and metadata
     """
     # Load dataset
     dpath = Path(__file__).parent.parent / "data" / "erf_data" / "congestus"
-    ds = xr.open_dataset(dpath / "5400_filtered_100m.nc")
+    ds = xr.open_dataset(dpath / filename)
 
     # Split into train/test
     ds_train, train_idx, ds_test, test_idx = split_by_index(ds, "loc", test_size, random_state)
