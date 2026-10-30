@@ -325,7 +325,6 @@ def compute_nwi_prefactor(encoder):
     Returns:
         prefactor: [n_latent+1, n_bins] array
     """
-    import torch
 
     # Get weight function matrix
     f = encoder.wf_mat().detach()  # [n_bins, n_latent+1]
@@ -400,7 +399,6 @@ def compute_dhdt(Z, T, S, rbin_median, encoder, decoder, m_scale=1.0, use_kohler
         dhdt: Condensation tendency in latent space [batch, 1, n_latent+1]
               In "normalized latent space" units (consistent with encoder training)
     """
-    import torch
 
     # Get reconstructed DSD (normalized - same as what encoder was trained on)
     g = decoder(Z)  # [batch, 1, n_bins] - normalized by m_scale

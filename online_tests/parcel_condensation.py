@@ -63,6 +63,7 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(project_root)
@@ -495,8 +496,6 @@ def compare(op: LatentCondensation, rom: dict, ref: dict) -> dict:
 
 
 def plot_comparison(op, rom, ref, cmp, path=None, spectra_times=None):
-    import matplotlib.pyplot as plt
-
     t = ref["t"]
     fig, ax = plt.subplots(2, 3, figsize=(15, 8))
     ax = ax.ravel()
