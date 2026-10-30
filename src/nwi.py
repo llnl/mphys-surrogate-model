@@ -28,10 +28,10 @@ class ResBlock(nn.Module):
 
         self.stack = nn.Sequential(
             nn.LayerNorm(num_features),
-            nn.LeakyReLU(),
+            nn.SiLU(),
             nn.Linear(num_features, num_features),
             nn.LayerNorm(num_features),
-            nn.LeakyReLU(),
+            nn.SiLU(),
             nn.Linear(num_features, num_features),
         )
     def forward(self, x):

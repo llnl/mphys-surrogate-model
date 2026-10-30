@@ -845,3 +845,288 @@ def plot_nnwi_weights(model, r_bins_edges):
     plt.yscale('log')
     plt.title("NNWI Weight Functions")
     return fig
+
+
+def plot_condensation_projections(model, test_ids, x_test, dgdt_test, temp_test, sat_ratio_test, r_bins_edges, m_scale, cond_scale):
+    """
+    Plot projected condensation tendencies vs ground truth for test samples.
+
+    Note: For condensation, there is no separate dynamics model. We encode the
+    known condensation tendency and project it through the decoder.
+
+    Args:
+        model: Trained model with encoder and decoder (no dynamics)
+        test_ids: Indices of test samples to plot
+        x_test: Test DSDs (normalized) [n_test, n_bins]
+        dgdt_test: Test condensation tendencies (normalized) [n_test, n_bins]
+        temp_test: Test temperatures [n_test]
+        sat_ratio_test: Test saturation ratios [n_test]
+        r_bins_edges: Bin edges for radius
+        m_scale: Mass scale for denormalization
+        cond_scale: Condensation scale for denormalization
+    """
+    import torch
+
+    n_samples = len(test_ids)
+    fig, axs = plt.subplots(2, n_samples, figsize=(4*n_samples, 7), sharex=True)
+    if n_samples == 1:
+        axs = axs[:, np.newaxis]
+
+    model.eval()
+    with torch.no_grad():
+        for i, test_id in enumerate(test_ids):
+            # Get sample
+            x = torch.from_numpy(x_test[test_id:test_id+1, np.newaxis, :]).float()
+            dgdt_true = torch.from_numpy(dgdt_test[test_id:test_id+1, np.newaxis, :]).float()
+            temp = temp_test[test_id]
+            sat = sat_ratio_test[test_id]
+
+            # Forward pass
+            Z = model.encoder(x)
+            x_recon = model.decoder(Z).squeeze().numpy()
+
+            # Encode condensation tendency and project back
+            dhdt = model.encoder(dgdt_true)
+            Z_detached = Z.clone().detach().requires_grad_(True)
+            _, dgdt_proj = torch.func.jvp(model.decoder, (Z_detached,), (dhdt,))
+            dgdt_proj = dgdt_proj.squeeze().numpy()
+
+            # Denormalize for plotting
+            x_plot = x.squeeze().numpy() * m_scale
+            x_recon_plot = x_recon * m_scale
+            dgdt_true_plot = dgdt_true.squeeze().numpy() * cond_scale
+            dgdt_proj_plot = dgdt_proj * cond_scale
+
+            # Top row: DSD reconstruction
+            axs[0, i].step(r_bins_edges, x_plot, 'k-', label='True', linewidth=1.5, where='post')
+            axs[0, i].step(r_bins_edges, x_recon_plot, 'r--', label='Recon', linewidth=1.5, alpha=0.8, where='post')
+            axs[0, i].set_xscale('log')
+            axs[0, i].set_ylabel('dm/dlnr (kg/m³)')
+            axs[0, i].set_title(f'Sample {test_id}: T={temp:.1f}K, S={sat:.3f}')
+            axs[0, i].legend()
+            axs[0, i].grid(True, alpha=0.3)
+
+            # Bottom row: Condensation tendency
+            axs[1, i].step(r_bins_edges, dgdt_true_plot, 'k-', label='ERF', linewidth=1.5, where='post')
+            axs[1, i].step(r_bins_edges, dgdt_proj_plot, 'b--', label='Projected', linewidth=1.5, alpha=0.8, where='post')
+            axs[1, i].set_xscale('log')
+            axs[1, i].set_xlabel('r (m)')
+            axs[1, i].set_ylabel('dgdt (kg/m³/s/ln(R))')
+            axs[1, i].axhline(0, color='gray', linestyle=':', linewidth=1, alpha=0.5)
+            axs[1, i].legend()
+            axs[1, i].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_condensation_theory_comparison(model, test_ids, x_test, dgdt_test, temp_test, sat_ratio_test,
+                                        r_bins_edges, rbin_median, m_scale, cond_scale):
+    """
+    Plot comparison of projected condensation vs theoretical condensation.
+
+    Note: For condensation, there is no separate dynamics model. We encode the
+    theoretical condensation and project it through the decoder.
+
+    Args:
+        model: Trained model (encoder + decoder only)
+        test_ids: Indices of test samples
+        x_test: Test DSDs (normalized)
+        dgdt_test: Test condensation tendencies (normalized, for reference)
+        temp_test: Test temperatures [n_test]
+        sat_ratio_test: Test saturation ratios [n_test]
+        r_bins_edges: Bin edges
+        rbin_median: Median bin radii
+        m_scale: Mass scale
+        cond_scale: Condensation scale
+    """
+    import torch
+    from src.condensation_utils import compute_theoretical_condensation
+
+    n_samples = len(test_ids)
+    fig, axs = plt.subplots(2, n_samples, figsize=(4*n_samples, 7), sharex=True)
+    if n_samples == 1:
+        axs = axs[:, np.newaxis]
+
+    model.eval()
+    with torch.no_grad():
+        for i, test_id in enumerate(test_ids):
+            # Get sample
+            x = torch.from_numpy(x_test[test_id:test_id+1, np.newaxis, :]).float()
+            temp = torch.tensor([[temp_test[test_id]]]).float()
+            sat = torch.tensor([[sat_ratio_test[test_id]]]).float()
+
+            # Forward pass
+            Z = model.encoder(x)
+            x_recon = model.decoder(Z)
+
+            # Compute theoretical condensation and project it
+            x_recon_physical = x_recon * m_scale
+            rbin_median_torch = torch.from_numpy(rbin_median).float().reshape(1, 1, -1)
+            dgdt_theory = compute_theoretical_condensation(
+                x_recon_physical, temp.reshape(-1, 1, 1), sat.reshape(-1, 1, 1),
+                rbin_median_torch, use_kohler=False
+            )
+            dgdt_theory_norm = dgdt_theory / cond_scale
+
+            # Encode and project theoretical condensation
+            dhdt_theory = model.encoder(dgdt_theory_norm)
+            Z_detached = Z.clone().detach().requires_grad_(True)
+            _, dgdt_proj = torch.func.jvp(model.decoder, (Z_detached,), (dhdt_theory,))
+
+            # Convert to numpy for plotting (theory already computed above)
+            x_plot = x.squeeze().numpy() * m_scale
+            x_recon_plot = x_recon.squeeze().numpy() * m_scale
+            dgdt_proj_plot = dgdt_proj.squeeze().numpy() * cond_scale
+            dgdt_theory_plot = dgdt_theory.squeeze().numpy()  # Already in physical units
+
+            # Top row: DSD
+            axs[0, i].step(r_bins_edges, x_plot, 'k-', label='True', linewidth=1.5, where='post')
+            axs[0, i].step(r_bins_edges, x_recon_plot, 'r--', label='Recon', linewidth=1.5, alpha=0.8, where='post')
+            axs[0, i].set_xscale('log')
+            axs[0, i].set_ylabel('dm/dlnr (kg/m³)')
+            axs[0, i].set_title(f'Sample {test_id}: T={temp_test[test_id]:.1f}K, S={sat_ratio_test[test_id]:.3f}')
+            axs[0, i].legend()
+            axs[0, i].grid(True, alpha=0.3)
+
+            # Bottom row: Condensation (projected vs theory)
+            axs[1, i].step(r_bins_edges, dgdt_proj_plot, 'b-', label='Projected', linewidth=1.5, where='post')
+            axs[1, i].step(r_bins_edges, dgdt_theory_plot, 'g--', label='Theory', linewidth=1.5, alpha=0.8, where='post')
+            axs[1, i].set_xscale('log')
+            axs[1, i].set_xlabel('r (m)')
+            axs[1, i].set_ylabel('dgdt (kg/m³/s/ln(R))')
+            axs[1, i].axhline(0, color='gray', linestyle=':', linewidth=1, alpha=0.5)
+            axs[1, i].legend()
+            axs[1, i].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_condensation_latent_space(model, x_test, dgdt_test, temp_test, sat_ratio_test, rbin_median, m_scale, cond_scale, cond_loss_type="erf"):
+    """
+    Plot latent space representations of condensation tendencies in PHYSICAL units.
+
+    Compares:
+    - dhdt computed from thermodynamics (using compute_dhdt function)
+    - dhdt from encoding condensation data (ERF or theoretical, depending on loss type)
+
+    This validates whether the thermodynamic dhdt function correctly represents
+    the condensation tendency in latent space.
+
+    Args:
+        model: Trained model (encoder + decoder only)
+        x_test: Test DSDs (normalized) [n_test, n_bins]
+        dgdt_test: Test condensation tendencies (normalized) [n_test, n_bins]
+        temp_test: Test temperatures [n_test]
+        sat_ratio_test: Test saturation ratios [n_test]
+        rbin_median: Median bin radii [n_bins]
+        m_scale: Mass scale for de-normalizing DSDs
+        cond_scale: Condensation scale for de-normalizing tendencies
+        cond_loss_type: "erf" or "theory" - determines what to compare against
+    """
+    import torch
+    from src.condensation_utils import compute_dhdt, compute_theoretical_condensation
+
+    model.eval()
+    with torch.no_grad():
+        # Encode DSDs
+        x_torch = torch.from_numpy(x_test[:, np.newaxis, :]).float()
+        Z = model.encoder(x_torch)
+
+        # Get target condensation based on loss type
+        if cond_loss_type == "erf":
+            # Use actual ERF data
+            dgdt_target = dgdt_test
+            target_label = "ERF data"
+        else:  # "theory"
+            # Compute theoretical condensation from reconstructed DSDs
+            print("    Computing theoretical condensation for comparison...")
+            dgdt_theory_list = []
+            batch_size = 500
+
+            for i in range(0, len(x_test), batch_size):
+                end_i = min(i + batch_size, len(x_test))
+                x_batch = torch.from_numpy(x_test[i:end_i, np.newaxis, :]).float()
+                Z_batch = model.encoder(x_batch)
+                g_recon = model.decoder(Z_batch)
+
+                # De-normalize for theoretical calculation
+                g_recon_phys = g_recon * m_scale
+                T_batch = torch.from_numpy(temp_test[i:end_i]).float().reshape(-1, 1, 1)
+                S_batch = torch.from_numpy(sat_ratio_test[i:end_i]).float().reshape(-1, 1, 1)
+                rbin_torch = torch.from_numpy(rbin_median).float().reshape(1, 1, -1)
+
+                dgdt_theory_phys = compute_theoretical_condensation(
+                    g_recon_phys, T_batch, S_batch, rbin_torch, use_kohler=False
+                )
+                # Normalize back
+                dgdt_theory_list.append((dgdt_theory_phys / cond_scale).squeeze().cpu().numpy())
+
+            dgdt_target = np.concatenate(dgdt_theory_list, axis=0)
+            target_label = "theory"
+
+        # Encode target condensation tendencies
+        dgdt_torch = torch.from_numpy(dgdt_target[:, np.newaxis, :]).float()
+        dhdt_encoded = model.encoder(dgdt_torch).squeeze().numpy()
+
+        # Compute dhdt from thermodynamics using the dhdt function
+        # Need to process in batches to avoid memory issues
+        batch_size = 500
+        n_samples = len(x_test)
+        dhdt_computed_list = []
+
+        for i in range(0, n_samples, batch_size):
+            end_i = min(i + batch_size, n_samples)
+            Z_batch = Z[i:end_i]
+            T_batch = torch.from_numpy(temp_test[i:end_i]).float().reshape(-1, 1, 1)
+            S_batch = torch.from_numpy(sat_ratio_test[i:end_i]).float().reshape(-1, 1, 1)
+            rbin_torch = torch.from_numpy(rbin_median).float().reshape(1, 1, -1)
+
+            dhdt_batch = compute_dhdt(
+                Z_batch, T_batch, S_batch, rbin_torch,
+                model.encoder, model.decoder, m_scale=m_scale, use_kohler=False
+            )
+            dhdt_computed_list.append(dhdt_batch.squeeze().cpu().numpy())
+
+        dhdt_computed = np.concatenate(dhdt_computed_list, axis=0)
+
+    # De-normalize to physical units
+    # dhdt_computed: uses g_normalized, so multiply by m_scale
+    # dhdt_encoded: uses dgdt_normalized and encoder trained on x/m_scale, so multiply by m_scale * cond_scale
+    dhdt_computed_physical = dhdt_computed * m_scale
+    dhdt_encoded_physical = dhdt_encoded * cond_scale
+
+    n_latent = dhdt_encoded_physical.shape[1]
+    fig, axs = plt.subplots(1, n_latent, figsize=(5*n_latent, 4))
+    if n_latent == 1:
+        axs = [axs]
+
+    for i in range(n_latent):
+        # Scatter plot: thermodynamically-computed vs encoded actual data (both in physical units)
+        axs[i].scatter(dhdt_encoded_physical[:, i], dhdt_computed_physical[:, i], alpha=0.3, s=10,
+                      c=sat_ratio_test - 1.0, cmap='RdBu', vmin=-0.02, vmax=0.02)
+
+        # 1:1 line
+        lim = [min(dhdt_encoded_physical[:, i].min(), dhdt_computed_physical[:, i].min()),
+               max(dhdt_encoded_physical[:, i].max(), dhdt_computed_physical[:, i].max())]
+        axs[i].plot(lim, lim, 'k--', alpha=0.5, linewidth=1, label='1:1')
+        axs[i].axhline(0, color='gray', linestyle=':', linewidth=1, alpha=0.3)
+        axs[i].axvline(0, color='gray', linestyle=':', linewidth=1, alpha=0.3)
+
+        axs[i].set_xlabel(f'Encoded dh{i}/dt\n(from {target_label}, kg/m³/s)', fontsize=10)
+        axs[i].set_ylabel(f'Computed dh{i}/dt\n(from thermodynamics, kg/m³/s)', fontsize=10)
+        axs[i].set_title(f'Latent dimension {i}')
+        axs[i].grid(True, alpha=0.3)
+        axs[i].set_aspect('equal')
+        axs[i].legend(fontsize=8)
+
+        # Compute and display R²
+        from sklearn.metrics import r2_score
+        r2 = r2_score(dhdt_encoded_physical[:, i], dhdt_computed_physical[:, i])
+        axs[i].text(0.05, 0.95, f'R² = {r2:.4f}', transform=axs[i].transAxes,
+                   verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+    plt.suptitle(f'Condensation in Latent Space: Thermodynamics vs. {target_label.upper()} (Physical Units)', fontsize=12, y=1.02)
+    plt.tight_layout()
+    return fig
