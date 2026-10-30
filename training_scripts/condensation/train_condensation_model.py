@@ -64,7 +64,7 @@ params = {
     # - loss_weight_recon: DSD reconstruction (KL divergence)
     # - loss_weight_cond_dx: Projected condensation in physical space
     "loss_weight_recon": 1.0,
-    "loss_weight_cond_dx": 1e4,
+    "loss_weight_cond_dx": 1.0,
 
     # Output
     "save": True,
