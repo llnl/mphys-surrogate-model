@@ -159,13 +159,13 @@ class TestAllProcessesData(unittest.TestCase):
     def test_normalized_spectra_are_bin_fractions_that_sum_to_one(self):
         for arrays in self.result["arrays"].values():
             np.testing.assert_allclose(
-                arrays["dmdlnr"].sum(axis=-1), 1.0, rtol=1e-6, atol=1e-7
+                arrays["mass_dsd"].sum(axis=-1), 1.0, rtol=1e-6, atol=1e-7
             )
             np.testing.assert_allclose(
-                arrays["dndlnr"].sum(axis=-1), 1.0, rtol=1e-6, atol=1e-7
+                arrays["number_dsd"].sum(axis=-1), 1.0, rtol=1e-6, atol=1e-7
             )
-            self.assertTrue(np.all(arrays["dmdlnr"] >= 0.0))
-            self.assertTrue(np.all(arrays["dndlnr"] >= 0.0))
+            self.assertTrue(np.all(arrays["mass_dsd"] >= 0.0))
+            self.assertTrue(np.all(arrays["number_dsd"] >= 0.0))
         self.assertEqual(
             self.result["metadata"]["spectra_representation"],
             "normalized_bin_fraction",
@@ -241,7 +241,7 @@ class TestAllProcessesData(unittest.TestCase):
 
             # The helper returns a new mapping and does not replace normalized data.
             self.assertIsNot(physical, normalized)
-            np.testing.assert_allclose(normalized["dmdlnr"].sum(axis=1), 1.0)
+            np.testing.assert_allclose(normalized["mass_dsd"].sum(axis=1), 1.0)
 
     def test_torch_dataset_batch_denormalization_round_trip(self):
         normalized_arrays = self.result["arrays"]["train"]
@@ -306,8 +306,8 @@ class TestAllProcessesData(unittest.TestCase):
                 [result["arrays"][split][field] for split in split_order], axis=0
             )
             for field in (
-                "dmdlnr",
-                "dndlnr",
+                "mass_dsd",
+                "number_dsd",
                 "M",
                 "N",
                 "temp",
@@ -324,11 +324,22 @@ class TestAllProcessesData(unittest.TestCase):
             split: denormalize_all_processes(result["arrays"][split], metadata)
             for split in split_order
         }
+        physical_fields = (
+            "dmdlnr",
+            "dndlnr",
+            "M",
+            "N",
+            "temp",
+            "rh",
+            "dgdt_cond",
+            "dgdt_coal",
+            "vt_mass_flux",
+        )
         physical = {
             field: np.concatenate(
                 [physical_splits[split][field] for split in split_order], axis=0
             )
-            for field in scaled
+            for field in physical_fields
         }
 
         print(f"\nFull dataset: {DEFAULT_ALL_PROCESSES_PATH}")
@@ -351,8 +362,8 @@ class TestAllProcessesData(unittest.TestCase):
         print_distribution_table(
             "Scaled distributions",
             {
-                "mass bin fraction": scaled["dmdlnr"],
-                "number bin fraction": scaled["dndlnr"],
+                "mass bin fraction": scaled["mass_dsd"],
+                "number bin fraction": scaled["number_dsd"],
                 "M / M_scale": scaled["M"],
                 "N / N_scale": scaled["N"],
                 "temperature [K]": scaled["temp"],
@@ -368,10 +379,10 @@ class TestAllProcessesData(unittest.TestCase):
         for name, values in scaled.items():
             self.assertTrue(np.all(np.isfinite(values)), name)
         np.testing.assert_allclose(
-            scaled["dmdlnr"].sum(axis=1), 1.0, rtol=1e-6, atol=1e-6
+            scaled["mass_dsd"].sum(axis=1), 1.0, rtol=1e-6, atol=1e-6
         )
         np.testing.assert_allclose(
-            scaled["dndlnr"].sum(axis=1), 1.0, rtol=1e-6, atol=1e-6
+            scaled["number_dsd"].sum(axis=1), 1.0, rtol=1e-6, atol=1e-6
         )
 
     def test_full_dataset_dataloaders(self):
@@ -395,8 +406,8 @@ class TestAllProcessesData(unittest.TestCase):
             {"train": 56_438, "validate": 14_109, "test": 18_950},
         )
         expected_fields = {
-            "dmdlnr",
-            "dndlnr",
+            "mass_dsd",
+            "number_dsd",
             "M",
             "N",
             "temp",
@@ -414,8 +425,8 @@ class TestAllProcessesData(unittest.TestCase):
 
             batch = next(iter(loader))
             self.assertEqual(set(batch), expected_fields)
-            self.assertEqual(batch["dmdlnr"].shape, (expected_batch_size, 64))
-            self.assertEqual(batch["dndlnr"].shape, (expected_batch_size, 64))
+            self.assertEqual(batch["mass_dsd"].shape, (expected_batch_size, 64))
+            self.assertEqual(batch["number_dsd"].shape, (expected_batch_size, 64))
             self.assertEqual(batch["dgdt_cond"].shape, (expected_batch_size, 64))
             self.assertEqual(batch["dgdt_coal"].shape, (expected_batch_size, 64))
             self.assertEqual(batch["vt_mass_flux"].shape, (expected_batch_size, 64))
@@ -427,13 +438,13 @@ class TestAllProcessesData(unittest.TestCase):
                 self.assertTrue(torch.isfinite(batch[field]).all().item(), field)
             self.assertEqual(batch["sample_index"].dtype, torch.int64)
             torch.testing.assert_close(
-                batch["dmdlnr"].sum(dim=-1),
+                batch["mass_dsd"].sum(dim=-1),
                 torch.ones(expected_batch_size),
                 rtol=1e-6,
                 atol=1e-6,
             )
             torch.testing.assert_close(
-                batch["dndlnr"].sum(dim=-1),
+                batch["number_dsd"].sum(dim=-1),
                 torch.ones(expected_batch_size),
                 rtol=1e-6,
                 atol=1e-6,

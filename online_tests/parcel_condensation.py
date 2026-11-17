@@ -157,9 +157,10 @@ class LatentCondensation:
     """Wraps an NWI encoder/decoder and evaluates dZ/dt for condensation."""
 
     def __init__(self, encoder, decoder, grid: BinGrid, m_scale: float = 1.0,
-                 prefactor: str = "autograd", fd_grid: str = "encoder",
-                 use_kohler: bool = False):
+                   prefactor: str = "autograd", fd_grid: str = "encoder",
+                   use_kohler: bool = False, model=None, n_scale: float = 1.0):
         self.encoder, self.decoder = encoder, decoder
+        self.model, self.n_scale = model, float(n_scale)
         self.grid, self.m_scale, self.use_kohler = grid, float(m_scale), use_kohler
         for m in (encoder, decoder):
             m.eval()
@@ -198,17 +199,39 @@ class LatentCondensation:
         return (dfdlnr + 3.0 * f).T
 
     # --- encode / decode in physical per-kg units ------------------------- #
-    def encode(self, g_kg: np.ndarray) -> np.ndarray:
-        """[..., N] per-kg mass density -> [..., L+1] per-kg latent (linear)."""
-        return np.asarray(g_kg) @ self.wf
+    def encode(self, dmdlnr_per_kg: np.ndarray, N_per_kg=None) -> np.ndarray:
+        """Encode kg-water/kg-dry-air/ln(r) after integrating each log bin."""
+        mass_per_bin = np.asarray(dmdlnr_per_kg) * self.grid.dlnr
+        latent_mass = mass_per_bin @ self.wf
+        if self.model is not None and self.model.number_aware:
+            if N_per_kg is None:
+                raise ValueError("N_per_kg is required for a number-aware parcel")
+            N_per_kg = np.broadcast_to(np.asarray(N_per_kg), latent_mass.shape[:-1])
+            return np.concatenate([latent_mass, N_per_kg[..., None]], axis=-1)
+        return latent_mass
 
-    def decode(self, Z_kg: np.ndarray, rho: float | np.ndarray = 1.0) -> np.ndarray:
+    def _scaled_state(self, Z_kg, rho):
+        """Convert physical per-kg parcel state to independently scaled model state."""
         Z_kg = np.atleast_2d(Z_kg)
         rho = np.broadcast_to(np.asarray(rho, dtype=float), (Z_kg.shape[0],))
-        Zm = torch.as_tensor(Z_kg * rho[:, None] / self.m_scale, dtype=torch.float32)
+        if self.model is not None and self.model.number_aware:
+            mass_state = Z_kg[:, :-1] * rho[:, None] / self.m_scale
+            number_state = Z_kg[:, -1:] * rho[:, None] / self.n_scale
+            return torch.as_tensor(
+                np.concatenate([mass_state, number_state], axis=-1), dtype=torch.float32
+            )
+        return torch.as_tensor(Z_kg * rho[:, None] / self.m_scale, dtype=torch.float32)
+
+    def decode(self, Z_kg: np.ndarray, rho: float | np.ndarray = 1.0) -> np.ndarray:
+        """Decode model bin masses to physical per-kg ``dmdlnr``."""
+        Z_kg = np.atleast_2d(Z_kg)
+        rho = np.broadcast_to(np.asarray(rho, dtype=float), (Z_kg.shape[0],))
+        Zm = self._scaled_state(Z_kg, rho)
         with torch.no_grad():
-            g = self.decoder(Zm).reshape(Z_kg.shape[0], -1).double().numpy()
-        return g * self.m_scale / rho[:, None]
+            decoder = self.model.decode_mass if self.model is not None and self.model.number_aware else self.decoder
+            mass_per_bin = decoder(Zm).reshape(Z_kg.shape[0], -1).double().numpy()
+        mass_per_bin = mass_per_bin * self.m_scale / rho[:, None]
+        return mass_per_bin / self.grid.dlnr
 
     def v_cond(self, T, S):
         """dlnr/dt [B, N] at r_eval, using the repo's drdt (same G_func, esat)."""
@@ -219,8 +242,31 @@ class LatentCondensation:
 
     def tendency(self, Z_kg, T, S, rho=1.0):
         """dZ_kg/dt [B, L+1]. Homogeneous of degree 1 in Z_kg."""
-        g = self.decode(Z_kg, rho)
-        return (g * self.v_cond(T, S)) @ self.P.T
+        dmdlnr = self.decode(Z_kg, rho)
+        mass_per_bin = dmdlnr * self.grid.dlnr
+        dZ_mass = (mass_per_bin * self.v_cond(T, S)) @ self.P.T
+        if self.model is not None and self.model.number_aware:
+            return np.concatenate([dZ_mass, np.zeros((len(dZ_mass), 1))], axis=-1)
+        return dZ_mass
+
+    def liquid_mass(self, Z_kg):
+        """Total liquid water represented by the latent mass coordinate."""
+        mass_index = -2 if self.model is not None and self.model.number_aware else -1
+        return np.asarray(Z_kg)[..., mass_index]
+
+    def decode_number(self, Z_kg, rho=1.0):
+        """Decode number-bin fractions and physical total N for diagnostics."""
+        if self.model is None or not self.model.number_aware:
+            raise RuntimeError("Checkpoint is not number-aware")
+        Z_kg = np.atleast_2d(Z_kg)
+        rho = np.broadcast_to(np.asarray(rho, dtype=float), (Z_kg.shape[0],))
+        Zm = self._scaled_state(Z_kg, rho)
+        with torch.no_grad():
+            fractions = self.model.reconstruct_number(Zm)
+        # N is an explicit parcel/dynamics coordinate; number shape is diagnosed
+        # independently from the mass reconstruction.
+        total_number = Zm[..., -1].double().numpy() * self.n_scale / rho
+        return fractions.double().numpy(), total_number
 
 
 # --------------------------------------------------------------------------- #
@@ -308,16 +354,21 @@ def superdroplets_from_lognormal(grid: BinGrid, ic: LognormalIC, k_per_bin=16, m
     return r[keep], xi[keep]
 
 
-def superdroplets_from_binned(grid: BinGrid, g_kg, k_per_bin=16):
-    """Split binned mass density equally (in mass) across K sub-bins."""
+def superdroplets_from_binned(grid: BinGrid, dmdlnr_per_kg, k_per_bin=16):
+    """Split ``dmdlnr_per_kg`` equally in mass across K sub-bins."""
     r, xi = [], []
     for i, (l, rr) in enumerate(zip(grid.r_left, grid.r_right)):
-        if g_kg[i] <= 0:
+        if dmdlnr_per_kg[i] <= 0:
             continue
         sub_edges = np.geomspace(l, rr, k_per_bin + 1)
         rc = np.sqrt(sub_edges[:-1] * sub_edges[1:])
         r.append(rc)
-        xi.append(g_kg[i] * grid.dlnr[i] / k_per_bin / droplet_mass(rc))
+        xi.append(
+            dmdlnr_per_kg[i]
+            * grid.dlnr[i]
+            / k_per_bin
+            / droplet_mass(rc)
+        )
     return np.concatenate(r), np.concatenate(xi)
 
 
@@ -380,7 +431,7 @@ class ROMParcel:
         self.op, self.forcing = op, forcing
 
     def ql(self, Z_kg):
-        return self.op.grid.dlnr0 * Z_kg[..., -1]
+        return self.op.liquid_mass(Z_kg)
 
     def rhs(self, t, y):
         z, p, T, qv, Z = y[0], y[1], y[2], y[3], y[4:]
@@ -388,12 +439,13 @@ class ROMParcel:
         S = current_S(t, p, T, qv, self.forcing)
         rho = rho_dry(p, T, qv)
         dZ = self.op.tendency(Z[None, :], T, S, rho)[0]
-        dql = self.op.grid.dlnr0 * dZ[-1]
+        dql = self.op.liquid_mass(dZ)
         return np.concatenate([thermo_rhs(t, z, p, T, qv, ql, dql, self.forcing), dZ])
 
-    def run(self, state0: ParcelState0, g0_kg, t_end, dt_out=1.0, method="LSODA",
+    def run(self, state0: ParcelState0, dmdlnr0_per_kg, t_end, dt_out=1.0, method="LSODA",
+            N0_per_kg=None,
             rtol=1e-6, fixed_dt=None):
-        Z0 = self.op.encode(g0_kg)
+        Z0 = self.op.encode(dmdlnr0_per_kg, N0_per_kg)
         y0 = np.concatenate([[state0.z, state0.p, state0.T, state0.qv()], Z0])
         atol = np.maximum(1e-8 * np.abs(y0), 1e-14)
         t, Y, nfev = _integrate(self.rhs, y0, t_end, dt_out, method, rtol, atol, fixed_dt)
@@ -473,13 +525,13 @@ def compare(op: LatentCondensation, rom: dict, ref: dict) -> dict:
     """Split ROM error into (i) autoencoder projection error and (ii) latent
     trajectory error, by encoding the reference spectra."""
     rho = rho_dry(ref["p"], ref["T"], ref["qv"])
-    Z_ref = op.encode(ref["g"])
+    Z_ref = op.encode(ref["g"], ref.get("N"))
     g_ae = op.decode(Z_ref, rho)  # best the AE can do on the true spectrum
 
     def l1(a, b):
         return np.abs(a - b).sum(axis=-1) / np.maximum(np.abs(b).sum(axis=-1), 1e-30)
 
-    ql_ref_in_range = op.grid.dlnr0 * ref["g"].sum(axis=1)
+    ql_ref_in_range = (ref["g"] * op.grid.dlnr).sum(axis=1)
     N_ref, reff_ref = spectral_moments(op.grid, ref["g"])
     N_rom, reff_rom = spectral_moments(op.grid, rom["g"])
     return {
@@ -567,8 +619,16 @@ def load_from_checkpoint(model_dir, r_eval_choice=None, prefactor="autograd", **
         grid = build(params["rbin_median"], r_eval_choice)
     else:
         grid = BinGrid.log_uniform(n_bins, r_eval_choice=r_eval_choice)
-    return LatentCondensation(model.encoder, model.decoder, grid,
-                              m_scale=params.get("m_scale", 1.0), prefactor=prefactor, **kw)
+    return LatentCondensation(
+        model.encoder,
+        model.decoder,
+        grid,
+        m_scale=params.get("m_scale", params.get("M_scale", 1.0)),
+        prefactor=prefactor,
+        model=model,
+        n_scale=params.get("N_scale", 1.0),
+        **kw,
+    )
 
 
 def load_from_torchscript(enc_path, dec_path, grid: BinGrid, m_scale=1.0, **kw):
@@ -637,7 +697,9 @@ def main(argv=None):
 
     ref = LagrangianParcel(op.grid, forcing, use_kohler=op.use_kohler).run(
         s0, r0, xi, args.t_end, args.dt_out)
-    rom = ROMParcel(op, forcing).run(s0, g0, args.t_end, args.dt_out, fixed_dt=args.fixed_dt)
+    rom = ROMParcel(op, forcing).run(
+        s0, g0, args.t_end, args.dt_out, N0_per_kg=xi.sum(), fixed_dt=args.fixed_dt
+    )
     cmp = compare(op, rom, ref)
 
     out = Path(args.out)
