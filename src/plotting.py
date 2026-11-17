@@ -21,21 +21,21 @@ sys.path.append(project_root)
 
 def plot_losses(
     losses,
-    test_losses=None,
+    val_losses=None,
     sub_losses=None,
     labels=None,
     title="Training Loss",
     saveas=None,
 ):
     """
-    Plot training and test losses over epochs.
+    Plot training and validation losses over epochs.
 
     This function visualizes the evolution of loss values during model training.
-    It can plot total training loss, total test loss, and any number of sub-losses
+    It can plot total training loss, total validation loss, and any number of sub-losses
     (such as regularization or reconstruction losses).
 
     :param losses: Sequence of total training loss values per epoch.
-    :param test_losses: Optional sequence of total test loss values per epoch.
+    :param val_losses: Optional sequence of total validation loss values per epoch.
     :param sub_losses: Optional list of sequences, each representing a sub-loss per epoch.
     :param labels: Optional list of labels for sub-losses.
     :param title: Title for the plot.
@@ -48,8 +48,8 @@ def plot_losses(
 
     # Plot losses
     ax.plot(losses, label="total train")
-    if test_losses is not None:
-        ax.plot(test_losses, label="total test", ls="--")
+    if val_losses is not None:
+        ax.plot(val_losses, label="total validation", ls="--")
     if sub_losses is not None:
         for j, loss in enumerate(sub_losses):
             ax.plot(loss, label=labels[j])

@@ -127,7 +127,7 @@ def objective(trial, params, n_bins, train_data, test_data, dsd_time, x_train, m
     best_model, _ = training_utils.train_and_eval(
         model=model,
         train_loader=train_loader,
-        test_loader=test_loader,
+        val_loader=test_loader,
         optimizer=optimizer,
         scheduler=scheduler,
         loss_fn=loss_fn,

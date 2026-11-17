@@ -370,7 +370,7 @@ def setup_optimization(model, params):
 def train_and_eval(
     model,
     train_loader,
-    test_loader,
+    val_loader,
     optimizer,
     scheduler,
     loss_fn,
@@ -385,7 +385,8 @@ def train_and_eval(
     Args:
         model: PyTorch model to train
         train_loader: Training data loader
-        test_loader: Test data loader
+        val_loader: Validation data loader used for model selection, scheduling,
+            and early stopping. It must not be the held-out test split.
         optimizer: Optimizer
         scheduler: Learning rate scheduler (optional)
         loss_fn: Function that computes loss given (model, batch, params, device)
@@ -404,8 +405,8 @@ def train_and_eval(
 
     # Initialize loss storage
     losses = {}
-    test_losses = {}
-    best_test_loss = float("inf")
+    val_losses = {}
+    best_val_loss = float("inf")
     best_model = None
 
     for epoch in range(n_epochs):
@@ -438,29 +439,44 @@ def train_and_eval(
                 losses[key] = np.zeros(n_epochs) * np.nan
             losses[key][epoch] = np.mean(values)
 
-        # Evaluation phase
+        # Validation phase. Accumulate sample-weighted means so the result does
+        # not depend on validation batch size or the final partial batch.
         model.eval()
+        val_sums = {}
+        val_samples = 0
         with torch.no_grad():
-            for batch in test_loader:
+            for batch in val_loader:
+                if isinstance(batch, dict):
+                    batch_size = next(iter(batch.values())).shape[0]
+                else:
+                    batch_size = batch[0].shape[0]
                 batch = move_batch_to_device(batch, device)
-                test_loss, test_loss_dict = loss_fn(model, batch, params, device)
+                _, val_loss_dict = loss_fn(model, batch, params, device)
+                val_samples += batch_size
+                for key, value in val_loss_dict.items():
+                    scalar = value.item() if isinstance(value, torch.Tensor) else value
+                    val_sums[key] = val_sums.get(key, 0.0) + scalar * batch_size
+        if val_samples == 0:
+            raise ValueError("Validation loader contains no samples")
 
-        # Store test losses
-        for key, value in test_loss_dict.items():
-            test_key = f"test_{key}"
-            if test_key not in test_losses:
-                test_losses[test_key] = np.zeros(n_epochs) * np.nan
-            test_losses[test_key][epoch] = value.item() if isinstance(value, torch.Tensor) else value
+        # Store validation losses and use the complete validation mean for all
+        # model-selection decisions.
+        for key, value_sum in val_sums.items():
+            val_key = f"val_{key}"
+            if val_key not in val_losses:
+                val_losses[val_key] = np.zeros(n_epochs) * np.nan
+            val_losses[val_key][epoch] = value_sum / val_samples
+        val_loss = val_losses["val_total"][epoch]
 
         # Save best model
-        if test_loss < best_test_loss:
-            best_test_loss = test_loss
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             best_model = copy.deepcopy(model)
 
         # Update learning rate
         if scheduler is not None:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(test_loss)
+                scheduler.step(val_loss)
             else:
                 scheduler.step()
 
@@ -470,7 +486,7 @@ def train_and_eval(
             print(
                 f"Epoch [{epoch}/{n_epochs}], "
                 f"Train Loss: {losses['total'][epoch]:.4f} | "
-                f"Test Loss: {test_losses['test_total'][epoch]:.4f} | "
+                f"Validation Loss: {val_losses['val_total'][epoch]:.4f} | "
                 f"LR: {scheduler.get_last_lr() if scheduler else [optimizer.param_groups[0]['lr']]} | "
                 f"Epoch Time: {epoch_end_time - epoch_start_time:.2f} s"
             )
@@ -490,12 +506,13 @@ def train_and_eval(
 
         # Early stopping
         if early_stopping is not None:
-            early_stopping(test_loss)
+            early_stopping(val_loss)
             if early_stopping.early_stop:
                 print("Training stopped early.")
                 break
 
-    # Combine train and test losses into single dict
-    all_losses = {**losses, **test_losses}
+    # Combine training and validation histories. The held-out test split is not
+    # evaluated by this training loop.
+    all_losses = {**losses, **val_losses}
 
     return best_model, all_losses

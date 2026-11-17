@@ -12,9 +12,8 @@ sys.path.append(project_root)
 
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
 
-from src import data_utils, model_factory, recon_condensation_losses, save_utils, training_utils, plotting
+from src import model_factory, recon_condensation_losses, save_utils, training_utils
 
 # Parameters - configure these for your desired model
 params = {
@@ -34,13 +33,9 @@ params = {
     "hidden_size": 128,
 
     # Data
-    "data_src": "congestus_5400_200m",
-    "data_file": "5400_filtered_200m.nc",  # smoother spectra than the 100m file
-    "test_size": 0.2,
-
     # Training
     "random_seed": 1,
-    "num_epochs": 100,
+    "num_epochs": 20,
     "batch_size": 500,
     "learning_rate": 1e-3,
     "wd": 1e-3,
@@ -50,6 +45,7 @@ params = {
 
     # Model parameters
     "latent_dim": 3,
+    "number_aware": True,
 
     # Loss parameters
     "tol": 1e-8,
@@ -64,10 +60,13 @@ params = {
     # - loss_weight_recon: DSD reconstruction (KL divergence)
     # - loss_weight_cond_dx: Projected condensation in physical space
     "loss_weight_recon": 1.0,
-    "loss_weight_cond_dx": 1.0,
+    "loss_weight_mass_recon": 1.0,
+    "loss_weight_number_recon": 1.0,
+    "loss_weight_cond_dx": 1e5,
 
     # Output
     "save": True,
+    "plot": True,
     "show_plots": True,
 }
 
@@ -86,18 +85,21 @@ if __name__ == "__main__":
 
     # Load data
     print("\nLoading condensation dataset...")
-    data = data_utils.open_congestus_5400_dataset(
-        test_size=params["test_size"],
-        random_state=params["random_seed"],
-        filename=params["data_file"],
-    )
-    print(f"Training samples: {data['x_train'].shape[0]}")
-    print(f"Test samples: {data['x_test'].shape[0]}")
+    loaders, metadata = training_utils.setup_all_processes_dataloaders(params)
+    train_loader = loaders["train"]
+    # Use validation for model selection; preserve the held-out test split.
+    val_loader = loaders["validate"]
+    print(f"Training samples: {metadata['split_sizes']['train']}")
+    print(f"Validation samples: {metadata['split_sizes']['validate']}")
+    print(f"Held-out test samples: {metadata['split_sizes']['test']}")
+    params.update(metadata["normalization"])
+    params["dlnr"] = metadata["dlnr"]
+    params["rbin_median"] = metadata["rbin_median"]
+    params["spectra_representation"] = metadata["spectra_representation"]
 
-    # Create dataloaders
-    train_loader, test_loader, metadata = training_utils.setup_dataloaders_cond(
-        params, data
-    )
+    # Number-aware models register the geometric-mean radii used to diagnose
+    # number DSDs, so these must be available when the model is constructed.
+    params["rbin_median"] = metadata["rbin_median"]
 
     # Create model using factory
     model = model_factory.create_model(
@@ -112,10 +114,7 @@ if __name__ == "__main__":
     print(f"Total parameters: {total_params} (condensation-aware autoencoder, no separate dynamics model)")
 
     # Add physical parameters to params for loss functions
-    params["rbin_median"] = metadata["rbin_median"]
-    params["rbin_eval"] = metadata["rbin_eval"]
-    params["m_scale"] = metadata["m_scale"]
-    params["cond_scale"] = metadata["cond_scale"]
+    params["rbin_eval"] = metadata.get("rbin_eval", "center")
 
     # Print loss configuration
     print(f"\nLoss configuration:")
@@ -138,7 +137,7 @@ if __name__ == "__main__":
     best_model, losses = training_utils.train_and_eval(
         model,
         train_loader,
-        test_loader,
+        val_loader,
         optimizer,
         scheduler,
         loss_fn,
@@ -170,92 +169,10 @@ if __name__ == "__main__":
         save_utils.plot_training_losses(losses, params, output_dir)
         print(f"Loss plot saved to: {output_dir}/losses.png")
 
-        # Additional plots if requested
         if params.get("plot", True):
-            print("\nGenerating analysis plots...")
-
-            # Select random test samples for visualization
-            n_samples = min(5, len(metadata["x_test"]))
-            test_ids = np.random.choice(len(metadata["x_test"]), n_samples, replace=False)
-
-            # Plot 1: DSD reconstructions
-            print("  - Plotting reconstructions...")
-            fig = plotting.plot_reconstructions(
-                best_model,
-                test_ids,
-                metadata["x_test"][:, np.newaxis, :],
-                metadata["r_bins_edges"]
+            print(
+                "Combined-data plotting is limited to training losses for now; "
+                "additional condensation plots have not yet been updated."
             )
-            fig.savefig(output_dir / "reconstructions.png", dpi=150, bbox_inches='tight')
-            if params["show_plots"]:
-                fig.show()
-            plt.close(fig)
-
-            # Plot 2: NWI weights (if applicable)
-            if params['encoder_type'] == "nwi":
-                print("  - Plotting NWI weights...")
-                fig = plotting.plot_nnwi_weights(best_model, metadata['r_bins_edges'])
-                fig.savefig(output_dir / "weights.png", dpi=150, bbox_inches='tight')
-                if params['show_plots']:
-                    fig.show()
-                plt.close(fig)
-
-            # Plot 3: Condensation tendency projections (if condensation loss is used)
-            if params["cond_loss_type"] != "none":
-                print("  - Plotting condensation projections...")
-                fig = plotting.plot_condensation_projections(
-                    best_model,
-                    test_ids,
-                    metadata["x_test"],
-                    metadata["dgdt_test"],
-                    metadata["temp_test"],
-                    metadata["sat_ratio_test"],
-                    metadata["r_bins_edges"],
-                    metadata["m_scale"],
-                    metadata["cond_scale"]
-                )
-                fig.savefig(output_dir / "condensation_projections.png", dpi=150, bbox_inches='tight')
-                if params["show_plots"]:
-                    fig.show()
-                plt.close(fig)
-
-                # Plot 4: Theory comparison (regardless of training loss type)
-                print("  - Plotting theory comparison...")
-                fig = plotting.plot_condensation_theory_comparison(
-                    best_model,
-                    test_ids,
-                    metadata["x_test"],
-                    metadata["dgdt_test"],
-                    metadata["temp_test"],
-                    metadata["sat_ratio_test"],
-                    metadata["r_bins_edges"],
-                    metadata["rbin_median"],
-                    metadata["m_scale"],
-                    metadata["cond_scale"]
-                )
-                fig.savefig(output_dir / "theory_comparison.png", dpi=150, bbox_inches='tight')
-                if params["show_plots"]:
-                    fig.show()
-                plt.close(fig)
-
-                # Plot 5: Latent space condensation
-                print("  - Plotting latent space...")
-                fig = plotting.plot_condensation_latent_space(
-                    best_model,
-                    metadata["x_test"],
-                    metadata["dgdt_test"],
-                    metadata["temp_test"],
-                    metadata["sat_ratio_test"],
-                    metadata["rbin_median"],
-                    metadata["m_scale"],
-                    metadata["cond_scale"],
-                    params["cond_loss_type"]
-                )
-                fig.savefig(output_dir / "latent_space.png", dpi=150, bbox_inches='tight')
-                if params["show_plots"]:
-                    fig.show()
-                plt.close(fig)
-
-            print(f"\nAll plots saved to: {output_dir}/")
 
     print("\nTraining complete!")

@@ -85,7 +85,7 @@ def train_model(args):
     _, losses = training_utils.train_and_eval(
         model=model,
         train_loader=train_loader,
-        test_loader=test_loader,
+        val_loader=test_loader,
         optimizer=optimizer,
         scheduler=scheduler,
         loss_fn=loss_fn,

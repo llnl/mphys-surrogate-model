@@ -177,14 +177,14 @@ def plot_training_losses(losses, params, output_dir):
     labels = []
 
     for key, value in losses.items():
-        if key[0:5] != "total" and key[0:4] != "test":
+        if key != "total" and not key.startswith("val_"):
             labels.append(key)
             sub_losses.append(value)
 
     # Plot
     fig = plotting.plot_losses(
         losses.get("total", []),
-        test_losses=losses.get("test_total", []),
+        val_losses=losses.get("val_total", []),
         sub_losses=sub_losses if sub_losses else None,
         labels=labels if labels else None,
         title="Training Loss",
