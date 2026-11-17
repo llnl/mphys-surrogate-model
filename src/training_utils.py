@@ -233,6 +233,37 @@ def setup_dataloaders_cond(params, data):
     return train_loader, test_loader, metadata
 
 
+def setup_all_processes_dataloaders(params, path=du.DEFAULT_ALL_PROCESSES_PATH):
+    """Create train, validation, and test loaders for the combined ERF data.
+
+    ``params`` may override ``M_scale``, ``N_scale``, ``coal_rate_scale``, and
+    ``v_scale`` in addition to the loader settings. The returned batches are
+    dictionaries keyed by the physical variable names.
+    """
+    data = du.open_all_processes_dataset(
+        path=path,
+        M_scale=params.get("M_scale", du.DEFAULT_M_SCALE),
+        N_scale=params.get("N_scale", du.DEFAULT_N_SCALE),
+        coal_rate_scale=params.get(
+            "coal_rate_scale", du.DEFAULT_COAL_RATE_SCALE
+        ),
+        v_scale=params.get("v_scale", du.DEFAULT_V_SCALE),
+    )
+    batch_size = params["batch_size"]
+    eval_batch_size = params.get("eval_batch_size", batch_size)
+    num_workers = params.get("num_workers", 0)
+    loaders = {
+        name: DataLoader(
+            dataset,
+            batch_size=batch_size if name == "train" else eval_batch_size,
+            shuffle=name == "train",
+            num_workers=num_workers,
+        )
+        for name, dataset in data["datasets"].items()
+    }
+    return loaders, data["metadata"]
+
+
 def setup_loss_weights(params, train_data):
     """
     Set up loss weights based on dynamics type.

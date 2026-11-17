@@ -12,6 +12,263 @@ from torch.utils.data import Dataset
 from src.constants import DIV_TOLERANCE
 
 
+DEFAULT_ALL_PROCESSES_PATH = (
+    Path(__file__).parent.parent
+    / "data"
+    / "erf_data"
+    / "congestus"
+    / "all_cases_all_processes_split.nc"
+)
+
+
+DEFAULT_M_SCALE = 1.0e-3  # kg / m^3
+DEFAULT_N_SCALE = 1.0e6  # 1 / m^3
+DEFAULT_COAL_RATE_SCALE = 1.0 / 600.0  # 1 / s
+DEFAULT_V_SCALE = 1.0  # m / s
+
+
+class AllProcessesDataset(Dataset):
+    """Samples containing spectra and all three warm-rain process targets."""
+
+    _tensor_fields = (
+        "dmdlnr",
+        "dndlnr",
+        "M",
+        "N",
+        "temp",
+        "rh",
+        "dgdt_cond",
+        "vt_mass_flux",
+        "dgdt_coal",
+    )
+
+    def __init__(self, arrays):
+        self.arrays = arrays
+
+    def __len__(self):
+        return len(self.arrays["M"])
+
+    def __getitem__(self, idx):
+        sample = {
+            name: torch.as_tensor(self.arrays[name][idx], dtype=torch.float32)
+            for name in self._tensor_fields
+        }
+        sample["sample_index"] = torch.as_tensor(
+            self.arrays["sample_index"][idx], dtype=torch.long
+        )
+        return sample
+
+
+def prepare_all_processes_dataset(
+    ds,
+    M_scale=DEFAULT_M_SCALE,
+    N_scale=DEFAULT_N_SCALE,
+    coal_rate_scale=DEFAULT_COAL_RATE_SCALE,
+    v_scale=DEFAULT_V_SCALE,
+):
+    """Prepare the combined ERF process dataset with fixed physical scales.
+
+    The mass and number spectra are converted to per-bin fractions and normalized
+    independently for every sample, so each spectrum sums to one. Total mass
+    ``M`` and number ``N`` include the bin widths in log-radius and are divided
+    by fixed physical scales. Temperature and relative humidity remain in
+    physical space.
+
+    Coalescence and sedimentation targets are scaled as::
+
+        dgdt_coal_normalized = dgdt_coal / (M * coal_rate_scale)
+        flux_normalized = vt_mass_flux / (M * v_scale)
+
+    The condensation tendency is returned in its original physical units because
+    no fixed condensation time scale is defined here.
+
+    Args:
+        ds: Combined :class:`xarray.Dataset` with a ``sample`` dimension and
+            preassigned ``split`` labels.
+        M_scale: Characteristic total mass concentration in kg/m^3.
+        N_scale: Characteristic total number concentration in 1/m^3.
+        coal_rate_scale: Characteristic coalescence rate in 1/s.
+        v_scale: Sedimentation velocity scale in m/s.
+
+    Returns:
+        Dictionary with ``datasets`` (train/validate/test PyTorch datasets),
+        ``arrays`` (their backing NumPy arrays), and normalization/bin metadata.
+    """
+    required = {
+        "split",
+        "dmdlnr",
+        "dndlnr",
+        "dgdt_cond",
+        "vt_mass_flux",
+        "dgdt_coal",
+        "temp",
+        "rh",
+        "rbin_l",
+        "rbin_r",
+    }
+    missing = required.difference(ds.variables)
+    if missing:
+        raise ValueError(f"Dataset is missing required variables: {sorted(missing)}")
+
+    split_labels = np.asarray(ds["split"].values).astype(str)
+    # The source file currently uses "val"; expose the less ambiguous public
+    # name "validate" while accepting either spelling in future files.
+    split_masks = {
+        "train": split_labels == "train",
+        "validate": np.isin(split_labels, ("val", "validate")),
+        "test": split_labels == "test",
+    }
+    empty = [name for name, mask in split_masks.items() if not mask.any()]
+    if empty:
+        raise ValueError(f"Dataset has no samples for split(s): {empty}")
+
+    scales = {
+        "M_scale": M_scale,
+        "N_scale": N_scale,
+        "coal_rate_scale": coal_rate_scale,
+        "v_scale": v_scale,
+    }
+    invalid_scales = [name for name, value in scales.items() if not np.isfinite(value) or value <= 0]
+    if invalid_scales:
+        raise ValueError(f"Normalization scales must be positive and finite: {invalid_scales}")
+
+    rbin_l = ds["rbin_l"].to_numpy()
+    rbin_r = ds["rbin_r"].to_numpy()
+    dlnr = np.log(rbin_r / rbin_l)
+    dmdlnr = ds["dmdlnr"].transpose("sample", "bin").to_numpy()
+    dndlnr = ds["dndlnr"].transpose("sample", "bin").to_numpy()
+    M = (dmdlnr * dlnr[None, :]).sum(axis=1)
+    N = (dndlnr * dlnr[None, :]).sum(axis=1)
+    if np.any(M <= 0) or np.any(N <= 0):
+        raise ValueError("Every sample must have positive total mass M and number N")
+
+    dgdt_cond = ds["dgdt_cond"].transpose("sample", "bin").to_numpy()
+    dgdt_coal = ds["dgdt_coal"].transpose("sample", "bin").to_numpy()
+    vt_mass_flux = ds["vt_mass_flux"].transpose("sample", "bin").to_numpy()
+
+    all_arrays = {}
+    datasets = {}
+    for split_name, mask in split_masks.items():
+        indices = np.flatnonzero(mask)
+        split_M = M[mask]
+        split_N = N[mask]
+        arrays = {
+            "dmdlnr": (
+                dmdlnr[mask] * dlnr[None, :] / split_M[:, None]
+            ).astype(np.float32),
+            "dndlnr": (
+                dndlnr[mask] * dlnr[None, :] / split_N[:, None]
+            ).astype(np.float32),
+            "M": (split_M / M_scale).astype(np.float32),
+            "N": (split_N / N_scale).astype(np.float32),
+            "temp": ds["temp"].values[mask].astype(np.float32),
+            "rh": ds["rh"].values[mask].astype(np.float32),
+            "dgdt_cond": dgdt_cond[mask].astype(np.float32),
+            "vt_mass_flux": (
+                vt_mass_flux[mask] / (split_M[:, None] * v_scale)
+            ).astype(np.float32),
+            "dgdt_coal": (
+                dgdt_coal[mask] / (split_M[:, None] * coal_rate_scale)
+            ).astype(np.float32),
+            "sample_index": indices.astype(np.int64),
+        }
+        all_arrays[split_name] = arrays
+        datasets[split_name] = AllProcessesDataset(arrays)
+
+    metadata = {
+        "n_bins": int(ds.sizes["bin"]),
+        "rbin_l": rbin_l,
+        "rbin_r": rbin_r,
+        "rbin_median": np.sqrt(rbin_l * rbin_r),
+        "dlnr": dlnr,
+        "spectra_representation": "normalized_bin_fraction",
+        "split_sizes": {name: int(mask.sum()) for name, mask in split_masks.items()},
+        "normalization": scales,
+    }
+    return {"datasets": datasets, "arrays": all_arrays, "metadata": metadata}
+
+
+def open_all_processes_dataset(
+    path=DEFAULT_ALL_PROCESSES_PATH,
+    M_scale=DEFAULT_M_SCALE,
+    N_scale=DEFAULT_N_SCALE,
+    coal_rate_scale=DEFAULT_COAL_RATE_SCALE,
+    v_scale=DEFAULT_V_SCALE,
+):
+    """Open and prepare the combined, pre-split ERF process dataset."""
+    with xr.open_dataset(path) as ds:
+        return prepare_all_processes_dataset(
+            ds, M_scale, N_scale, coal_rate_scale, v_scale
+        )
+
+
+def denormalize_all_processes(data, metadata):
+    """Convert combined-dataset arrays or a loader batch back to physical units.
+
+    This reverses the normalization performed by
+    :func:`prepare_all_processes_dataset`. The normalized spectra are per-bin
+    fractions, not densities, so reconstructing ``dmdlnr`` and ``dndlnr``
+    requires division by each bin's ``dlnr``::
+
+        M = M_normalized * M_scale
+        N = N_normalized * N_scale
+        dmdlnr = mass_bin_fraction * M / dlnr
+        dndlnr = number_bin_fraction * N / dlnr
+        dgdt_coal = dgdt_coal_normalized * M * coal_rate_scale
+        vt_mass_flux = flux_normalized * M * v_scale
+
+    Temperature, relative humidity, and ``dgdt_cond`` are already stored in
+    physical space and are returned unchanged. ``data`` may be a dictionary of
+    NumPy arrays from ``result["arrays"][split]`` or a dictionary of PyTorch
+    tensors produced by a DataLoader. Leading batch dimensions are preserved.
+
+    Args:
+        data: Normalized sample or batch dictionary.
+        metadata: Metadata returned by :func:`open_all_processes_dataset`.
+
+    Returns:
+        A new dictionary with physical M, N, spectra, coalescence tendency, and
+        sedimentation mass flux. Input data are not modified.
+    """
+    required = {"dmdlnr", "dndlnr", "M", "N", "dgdt_coal", "vt_mass_flux"}
+    missing = required.difference(data)
+    if missing:
+        raise ValueError(f"Normalized data are missing required fields: {sorted(missing)}")
+
+    scales = metadata["normalization"]
+    dlnr = metadata["dlnr"]
+    reference_spectrum = data["dmdlnr"]
+    if torch.is_tensor(reference_spectrum):
+        dlnr = torch.as_tensor(
+            dlnr,
+            dtype=reference_spectrum.dtype,
+            device=reference_spectrum.device,
+        )
+    else:
+        dlnr = np.asarray(dlnr, dtype=reference_spectrum.dtype)
+
+    M = data["M"] * scales["M_scale"]
+    N = data["N"] * scales["N_scale"]
+    physical = dict(data)
+    physical.update(
+        {
+            "M": M,
+            "N": N,
+            "dmdlnr": data["dmdlnr"] * M[..., None] / dlnr,
+            "dndlnr": data["dndlnr"] * N[..., None] / dlnr,
+            "dgdt_coal": (
+                data["dgdt_coal"]
+                * M[..., None]
+                * scales["coal_rate_scale"]
+            ),
+            "vt_mass_flux": (
+                data["vt_mass_flux"] * M[..., None] * scales["v_scale"]
+            ),
+        }
+    )
+    return physical
+
+
 def open_box_dataset():
     """
     Open box dataset. Paths are hardcoded but relative.
