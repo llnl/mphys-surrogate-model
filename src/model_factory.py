@@ -3,6 +3,8 @@ Model factory for composable encoder/decoder/dynamics architecture.
 Allows mixing and matching different encoder types, decoder types, and dynamics models.
 """
 
+import math
+
 import torch
 from torch import nn
 
@@ -15,12 +17,102 @@ class ComposedModel(nn.Module):
     Provides consistent interface regardless of component choices.
     """
 
-    def __init__(self, encoder, decoder, dynamics=None, dynamics_type="none"):
+    def __init__(
+        self,
+        encoder,
+        decoder,
+        dynamics=None,
+        dynamics_type="none",
+        number_aware=False,
+        rbin_median=None,
+        water_density=1000.0,
+        encoder_type=None,
+        M_scale=1.0,
+        N_scale=1.0,
+        ratio_tolerance=1.0e-12,
+    ):
         super(ComposedModel, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
         self.dzdt = dynamics  # Can be None for pure autoencoders
         self.dynamics_type = dynamics_type
+        self._number_aware = number_aware
+        self.encoder_type = encoder_type
+        self.M_scale = M_scale
+        self.N_scale = N_scale
+        self.ratio_tolerance = ratio_tolerance
+        if number_aware:
+            if rbin_median is None:
+                raise ValueError("number-aware models require rbin_median")
+            radii = torch.as_tensor(rbin_median, dtype=torch.get_default_dtype())
+            if radii.ndim != 1 or radii.numel() == 0 or torch.any(radii <= 0):
+                raise ValueError("rbin_median must be a nonempty 1D array of positive radii")
+            if radii.numel() != getattr(decoder, "n_bins", radii.numel()):
+                raise ValueError("rbin_median length must match the decoder bin count")
+            droplet_mass = (4.0 / 3.0) * torch.pi * water_density * radii**3
+        else:
+            droplet_mass = torch.empty(0, dtype=torch.get_default_dtype())
+        self.register_buffer("droplet_mass", droplet_mass)
+
+    @property
+    def number_aware(self):
+        return self._number_aware
+
+    def _shape_coordinates(self, latent_mass):
+        """Extract dimensionless shared spectral coordinates from ``[h, M]``."""
+        if self.encoder_type == "nwi":
+            mass = latent_mass[..., -1:].clamp_min(1.0e-12)
+            return latent_mass[..., :-1] / mass
+        return latent_mass[..., :-1]
+
+    def _decoder_state(self, latent_with_number, total_scale):
+        """Build ``[Z, total, log(M_physical/N_physical)]`` for a decoder."""
+        latent_mass = latent_with_number[..., :-1]
+        M = latent_mass[..., -1]
+        N = latent_with_number[..., -1]
+        ratio = torch.log(
+            (M * self.M_scale).clamp_min(self.ratio_tolerance)
+            / (N * self.N_scale).clamp_min(self.ratio_tolerance)
+        ).unsqueeze(-1)
+        shape = self._shape_coordinates(latent_mass)
+        if self.encoder_type == "nwi":
+            base = torch.cat(
+                [shape * total_scale.unsqueeze(-1), total_scale.unsqueeze(-1)], dim=-1
+            )
+        else:
+            base = torch.cat([shape, total_scale.unsqueeze(-1)], dim=-1)
+        return torch.cat([base, ratio], dim=-1)
+
+    def decode_mass(self, latent_with_number):
+        """Decode mass from state ``[Z, M, N]``, conditioned on log(M/N)."""
+        M = latent_with_number[..., -2]
+        return self.decoder(self._decoder_state(latent_with_number, M))
+
+    def diagnose_number_dsd(self, reconstructed_mass, tol=None):
+        """Infer normalized number DSD from reconstructed mass-bin amounts.
+
+        Each mass bin is divided by the mass of one water droplet at that bin's
+        geometric-mean radius, then the resulting number weights are normalized.
+        """
+        if not self.number_aware:
+            raise RuntimeError("This model was not created with number_aware=True")
+        tol = self.ratio_tolerance if tol is None else tol
+        mass = torch.clamp(reconstructed_mass, min=0.0)
+        number_weights = mass / self.droplet_mass.to(dtype=mass.dtype)
+        return number_weights / number_weights.sum(dim=-1, keepdim=True).clamp_min(tol)
+
+    def reconstruct_number(self, latent_with_number):
+        """Decode mass from ``[Z, M, N]`` and diagnose normalized number DSD."""
+        if latent_with_number.shape[-1] < 3:
+            raise ValueError("number-aware latent state must contain M and N")
+        return self.diagnose_number_dsd(self.decode_mass(latent_with_number))
+
+    def encode_with_number(self, mass_state, total_number):
+        """Encode mass and append N, producing ``[coordinates, M, N]``."""
+        latent = self.encoder(mass_state)
+        if total_number is None:
+            raise ValueError("total_number is required for number-aware models")
+        return torch.cat([latent, total_number.unsqueeze(-1)], dim=-1)
 
     def forward(self, x, *args):
         """
@@ -29,7 +121,7 @@ class ComposedModel(nn.Module):
 
         - autoregressive: forward(x, M) -> (reconstructed x at t+1, predicted M)
         - sindy/nn_dzdt: forward(x, M) -> dZ/dt where Z = [z, M]
-        - none: forward(x) -> reconstructed x
+        - none: forward(x, N) -> reconstructed x for number-aware models
         """
         if self.dynamics_type == "autoregressive":
             # x is lagged dimensioned DSDs, args[0] is M (redundant but kept for compatibility)
@@ -51,13 +143,23 @@ class ComposedModel(nn.Module):
         elif self.dynamics_type in ["sindy", "nn_dzdt"]:
             # x is current dimensioned DSD
             Z = self.encoder(x)
+            if self.number_aware:
+                if not args:
+                    raise ValueError("number-aware dynamics require total_number")
+                Z = torch.cat([Z, args[0].unsqueeze(-1)], dim=-1)
             dZdt = self.dzdt(Z)
             return dZdt
 
         elif self.dynamics_type == "none":
             # Pure autoencoder
             Z = self.encoder(x)
-            x_recon = self.decoder(Z)
+            if self.number_aware:
+                if not args:
+                    raise ValueError("number-aware autoencoders require total_number")
+                Z = torch.cat([Z, args[0].unsqueeze(-1)], dim=-1)
+                x_recon = self.decode_mass(Z)
+            else:
+                x_recon = self.decoder(Z)
             return x_recon
 
         else:
@@ -130,7 +232,12 @@ def create_decoder(decoder_type, n_bins, n_latent, params):
     decoder_cls = DECODER_REGISTRY[decoder_type]
 
     if decoder_type == "ffnn":
-        return decoder_cls(n_bins=n_bins, n_latent=n_latent, distribution=True)
+        return decoder_cls(
+            n_bins=n_bins,
+            n_latent=n_latent,
+            distribution=True,
+            condition_on_number=params.get("number_aware", False),
+        )
     elif decoder_type in ["nwi_simple", "nwi_deep"]:
         hidden_size = params.get("hidden_size", 128)
         num_blocks = params.get("num_blocks", 3)
@@ -139,6 +246,7 @@ def create_decoder(decoder_type, n_bins, n_latent, params):
             n_latent=n_latent,
             hidden_features=hidden_size,
             num_blocks=num_blocks,
+            condition_on_number=params.get("number_aware", False),
         )
     else:
         raise NotImplementedError(f"Decoder type {decoder_type} not yet implemented")
@@ -164,10 +272,11 @@ def create_dynamics(dynamics_type, n_latent, params):
 
     dynamics_cls = DYNAMICS_REGISTRY[dynamics_type]
 
+    state_size = n_latent + 1 + int(params.get("number_aware", False))
     if dynamics_type == "sindy":
         poly_order = params.get("poly_order", 2)
         return dynamics_cls(
-            n_latent=n_latent + 1,  # +1 for mass coordinate
+            n_latent=state_size,
             poly_order=poly_order,
             use_thresholds=False,
             nonneg=params['process'] == 'sedimentation'
@@ -175,7 +284,7 @@ def create_dynamics(dynamics_type, n_latent, params):
     elif dynamics_type == "nn_dzdt":
         layer_size = params.get("layer_size", (100, 100, 100))
         return dynamics_cls(
-            n_latent=n_latent + 1,
+            n_latent=state_size,
             layer_size=layer_size,
             nonneg=params['process'] == 'sedimentation'
         )
@@ -183,8 +292,8 @@ def create_dynamics(dynamics_type, n_latent, params):
         n_lag = params.get("n_lag", 1)
         layer_size = params.get("layer_size", (100, 100, 100))
         return dynamics_cls(
-            n_bins=n_latent + 1,
-            n_bins_in=n_latent * n_lag + 1,
+            n_bins=state_size,
+            n_bins_in=state_size * n_lag,
             layer_size=layer_size,
         )
     else:
@@ -225,6 +334,24 @@ def create_model(encoder_type, decoder_type, dynamics_type, params, n_bins):
         model = create_model("ffnn", "ffnn", "autoregressive", params, 64)
     """
     n_latent = params["latent_dim"]
+    number_aware = params.get("number_aware", False)
+    if number_aware:
+        missing_scales = [name for name in ("M_scale", "N_scale") if name not in params]
+        if missing_scales:
+            raise ValueError(
+                "number-aware models require dataset normalization scale(s): "
+                + ", ".join(missing_scales)
+            )
+        invalid_scales = [
+            name
+            for name in ("M_scale", "N_scale")
+            if not math.isfinite(params[name]) or params[name] <= 0
+        ]
+        if invalid_scales:
+            raise ValueError(
+                "number-aware model scales must be positive and finite: "
+                + ", ".join(invalid_scales)
+            )
 
     # Create components
     encoder = create_encoder(encoder_type, n_bins, n_latent, params)
@@ -232,6 +359,18 @@ def create_model(encoder_type, decoder_type, dynamics_type, params, n_bins):
     dynamics = create_dynamics(dynamics_type, n_latent, params)
 
     # Compose into single model
-    model = ComposedModel(encoder, decoder, dynamics, dynamics_type)
+    model = ComposedModel(
+        encoder,
+        decoder,
+        dynamics,
+        dynamics_type,
+        number_aware=number_aware,
+        rbin_median=params.get("rbin_median"),
+        water_density=params.get("water_density", 1000.0),
+        encoder_type=encoder_type,
+        M_scale=params["M_scale"] if number_aware else params.get("M_scale", 1.0),
+        N_scale=params["N_scale"] if number_aware else params.get("N_scale", 1.0),
+        ratio_tolerance=params.get("tol", 1.0e-12),
+    )
 
     return model

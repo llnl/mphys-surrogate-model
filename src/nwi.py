@@ -250,12 +250,15 @@ class SimpleDecoder(nn.Module):
     :param num_blocks: Number of simple blocks, defaults to 5
     :type num_blocks: int, optional
     """
-    def __init__(self, n_bins=64, n_latent=3, hidden_features=256, num_blocks=5):
+    def __init__(self, n_bins=64, n_latent=3, hidden_features=256, num_blocks=5,
+                 condition_on_number=False):
         super(SimpleDecoder, self).__init__()
         self.n_bins = n_bins
         self.n_latent = n_latent
+        self.condition_on_number = condition_on_number
 
-        self.network = SNN(n_latent, n_bins, hidden_features=hidden_features, num_blocks=num_blocks)
+        decoder_input_dim = n_latent + int(condition_on_number)
+        self.network = SNN(decoder_input_dim, n_bins, hidden_features=hidden_features, num_blocks=num_blocks)
         self.sm = Softmax(dim=-1)
 
     def forward(self, h):
@@ -266,7 +269,10 @@ class SimpleDecoder(nn.Module):
         :return: Reconstructed distribution of shape [B, T, N]
         :rtype: torch.Tensor
         """
-        hhat, mass = h_to_hhat_M(h)  # Convert to dimensionless latent variables and mass
+        base_h = h[..., : self.n_latent + 1]
+        hhat, mass = h_to_hhat_M(base_h)
+        if self.condition_on_number:
+            hhat = torch.cat([hhat, h[..., self.n_latent + 1 :]], dim=-1)
         xhat = self.network(hhat)
         return self.sm(xhat) * mass.unsqueeze(-1) # convert back to a normalized PSD, scale by mass
 
@@ -284,13 +290,16 @@ class DeepDecoder(nn.Module):
     :param eps: Small value to prevent log(0), defaults to LOG_TOLERANCE
     :type eps: float, optional
     """
-    def __init__(self, n_bins=64, n_latent=3, hidden_features=256, num_blocks=5, eps=LOG_TOLERANCE):
+    def __init__(self, n_bins=64, n_latent=3, hidden_features=256, num_blocks=5,
+                 eps=LOG_TOLERANCE, condition_on_number=False):
         super().__init__()
-        self.stack = DNN(n_latent, n_bins, hidden_features=hidden_features, num_resblocks=num_blocks)
+        decoder_input_dim = n_latent + int(condition_on_number)
+        self.stack = DNN(decoder_input_dim, n_bins, hidden_features=hidden_features, num_resblocks=num_blocks)
         self.eps = eps
         self.sm = Softmax(dim=-1)
         self.n_bins = n_bins
         self.n_latent = n_latent
+        self.condition_on_number = condition_on_number
 
     def forward(self, h):
         """Decode latent representation to distribution using log transform.
@@ -301,9 +310,14 @@ class DeepDecoder(nn.Module):
         :rtype: torch.Tensor
         """
         B = h.shape[0]
-        hhat, mass = h_to_hhat_M(h)
+        base_h = h[..., : self.n_latent + 1]
+        hhat, mass = h_to_hhat_M(base_h)
         logh = torch.log(hhat + self.eps)
-        logh = logh.reshape(-1, self.n_latent)
+        if self.condition_on_number:
+            # Conditioning values such as log(M/N) may be negative and must not
+            # be passed through a second logarithm.
+            logh = torch.cat([logh, h[..., self.n_latent + 1 :]], dim=-1)
+        logh = logh.reshape(-1, self.n_latent + int(self.condition_on_number))
         xhat = self.stack(logh)
         xhat = xhat.reshape(B, -1, self.n_bins)
         return self.sm(xhat) * mass # convert back to normalized PSD

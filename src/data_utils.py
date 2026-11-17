@@ -31,8 +31,8 @@ class AllProcessesDataset(Dataset):
     """Samples containing spectra and all three warm-rain process targets."""
 
     _tensor_fields = (
-        "dmdlnr",
-        "dndlnr",
+        "mass_dsd",
+        "number_dsd",
         "M",
         "N",
         "temp",
@@ -153,10 +153,10 @@ def prepare_all_processes_dataset(
         split_M = M[mask]
         split_N = N[mask]
         arrays = {
-            "dmdlnr": (
+            "mass_dsd": (
                 dmdlnr[mask] * dlnr[None, :] / split_M[:, None]
             ).astype(np.float32),
-            "dndlnr": (
+            "number_dsd": (
                 dndlnr[mask] * dlnr[None, :] / split_N[:, None]
             ).astype(np.float32),
             "M": (split_M / M_scale).astype(np.float32),
@@ -230,14 +230,21 @@ def denormalize_all_processes(data, metadata):
         A new dictionary with physical M, N, spectra, coalescence tendency, and
         sedimentation mass flux. Input data are not modified.
     """
-    required = {"dmdlnr", "dndlnr", "M", "N", "dgdt_coal", "vt_mass_flux"}
+    required = {
+        "mass_dsd",
+        "number_dsd",
+        "M",
+        "N",
+        "dgdt_coal",
+        "vt_mass_flux",
+    }
     missing = required.difference(data)
     if missing:
         raise ValueError(f"Normalized data are missing required fields: {sorted(missing)}")
 
     scales = metadata["normalization"]
     dlnr = metadata["dlnr"]
-    reference_spectrum = data["dmdlnr"]
+    reference_spectrum = data["mass_dsd"]
     if torch.is_tensor(reference_spectrum):
         dlnr = torch.as_tensor(
             dlnr,
@@ -254,8 +261,8 @@ def denormalize_all_processes(data, metadata):
         {
             "M": M,
             "N": N,
-            "dmdlnr": data["dmdlnr"] * M[..., None] / dlnr,
-            "dndlnr": data["dndlnr"] * N[..., None] / dlnr,
+            "dmdlnr": data["mass_dsd"] * M[..., None] / dlnr,
+            "dndlnr": data["number_dsd"] * N[..., None] / dlnr,
             "dgdt_coal": (
                 data["dgdt_coal"]
                 * M[..., None]

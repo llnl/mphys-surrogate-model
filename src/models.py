@@ -80,7 +80,8 @@ class FFNNEncoder(torch.nn.Module):
 
 
 class FFNNDecoder(torch.nn.Module):
-    def __init__(self, n_bins=64, n_latent=3, distribution=True):
+    def __init__(self, n_bins=64, n_latent=3, distribution=True,
+                 condition_on_number=False):
         """
         Pytorch model for the feed-forward neural network decoder part of an
         autoencoder. Used in multiple other models.
@@ -90,12 +91,15 @@ class FFNNDecoder(torch.nn.Module):
         :param distribution: Flag to indicate whether output is a true
                              distribution (area under curve is 1) or
                              not normalized.
+        :param condition_on_number: Include log(M/N) as a decoder input.
         """
         super(FFNNDecoder, self).__init__()
 
         self.n_bins = n_bins
         self.n_latent = n_latent
-        self.layer1 = Linear(n_latent, int(n_bins / 8))
+        self.condition_on_number = condition_on_number
+        decoder_input_dim = n_latent + int(condition_on_number)
+        self.layer1 = Linear(decoder_input_dim, int(n_bins / 8))
         self.layer2 = Linear(int(n_bins / 8), int(n_bins / 4))
         self.layer3 = Linear(int(n_bins / 4), int(n_bins / 2))
         self.layer4 = Linear(int(n_bins / 2), n_bins)
@@ -120,8 +124,10 @@ class FFNNDecoder(torch.nn.Module):
     def forward(self, z_with_mass):
         # Extract latent variables and mass
         # Works with any number of leading dimensions: [..., latent+1]
-        z = z_with_mass[..., :-1]
-        mass = z_with_mass[..., -1:]
+        z = z_with_mass[..., : self.n_latent]
+        mass = z_with_mass[..., self.n_latent : self.n_latent + 1]
+        if self.condition_on_number:
+            z = torch.cat([z, z_with_mass[..., self.n_latent + 1 :]], dim=-1)
 
         # Decode to normalized DSD
         x_norm = self.layer1(z)

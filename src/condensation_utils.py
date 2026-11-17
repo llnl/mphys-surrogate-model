@@ -419,7 +419,9 @@ def compute_dhdt(Z, T, S, rbin_median, encoder, decoder, m_scale=1.0, use_kohler
 
     dhdt = torch.zeros_like(Z)  # [batch, 1, n_latent+1]
 
-    for j in range(n_latent):
+    # A number-aware state appends N after the mass latent state. Condensation
+    # contributes zero dN/dt, so only fill coordinates represented by P.
+    for j in range(min(n_latent, prefactor.shape[0])):
         # prefactor[j, :] is [n_bins] (dimensionless)
         # g is [batch, 1, n_bins] (normalized, dimensionless)
         # v_cond is [batch, 1, n_bins] (1/s)

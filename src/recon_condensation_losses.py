@@ -10,6 +10,12 @@ from src.condensation_utils import (
     compute_theoretical_condensation,
     eulerian_from_lagrangian,
 )
+from src.reconstruction_losses import (
+    _dlnr_tensor,
+    _reconstruction_loss_dict,
+    _reconstruction_losses,
+    _weighted_reconstruction_loss,
+)
 
 
 def _cond_target_form(params):
@@ -21,161 +27,165 @@ def _cond_target_form(params):
         raise ValueError(f"cond_target must be 'eulerian' or 'lagrangian', got {form}")
     return form
 
-# Global loss functions
 mse = torch.nn.MSELoss()
-divergence = torch.nn.KLDivLoss(reduction="batchmean", log_target=True)
 
 
-def compute_condensation_loss_erf(model, batch, params, device):
-    """
-    Loss for condensation-aware autoencoder trained against ERF ground truth.
+def _project_condensation_tendency(model, latent, batch, params, device):
+    """Project the theoretical latent condensation tendency into mass-bin space."""
+    batch_temp = batch["temp"].reshape(-1, 1, 1)
+    batch_sat = batch["rh"].reshape(-1, 1, 1)
+    rbin_median = torch.as_tensor(
+        params["rbin_median"], dtype=latent.dtype, device=device
+    ).reshape(1, 1, -1)
+    decoder = model.decode_mass if model.number_aware else model.decoder
+    dhdt = compute_dhdt(
+        latent,
+        batch_temp,
+        batch_sat,
+        rbin_median,
+        model.encoder,
+        decoder,
+        m_scale=params["M_scale"],
+        use_kohler=False,
+    )
+    latent_for_jvp = latent.detach().requires_grad_(True)
+    _, projected_tendency = torch.func.jvp(
+        decoder, (latent_for_jvp,), (dhdt,)
+    )
+    return projected_tendency, rbin_median
 
-    No dynamics model is trained. Instead, we compute dhdt from thermodynamics
-    using the dhdt function (condensation velocity + NWI prefactor), project it
-    through the decoder, and compare to ERF dgdt_cond.
+
+def compute_condensation_erf_term(model, batch, latent, params, device):
+    """Return only the unweighted projected-vs-ERF condensation tendency MSE.
+
+    This term does not encode, decode a reconstruction for KL, apply a loss
+    weight, or combine itself with reconstruction losses.
 
     Args:
-        model: ComposedModel with encoder and decoder (no dynamics)
-        batch: Tuple of (batch_x, batch_dgdt, batch_temp, batch_sat, batch_m)
-               - batch_x: dimensioned DSD [batch, 1, n_bins]
-               - batch_dgdt: target condensation tendency from ERF [batch, 1, n_bins]
-               - batch_temp: temperature [batch, 1, 1] in Kelvin
-               - batch_sat: saturation ratio [batch, 1, 1]
-               - batch_m: total mass [batch, 1, 1]
-        params: Parameters dict with loss weights and 'rbin_median'
-        device: Compute device
+        model: Composed model with encoder and mass decoder.
+        batch: Dictionary batch from ``AllProcessesDataset``.
+        latent: Previously computed state ``[Z, M]`` or ``[Z, M, N]``.
+        params: Parameters containing ``rbin_median``, ``dlnr``, and ``M_scale``.
+        device: Compute device.
 
     Returns:
-        total_loss, loss_dict
+        Scalar, unweighted condensation tendency MSE.
     """
-    batch_x, batch_dgdt, batch_temp, batch_sat, batch_m = batch
-
-    # 1. Encode DSD to latent space
-    Z = model.encoder(batch_x)
-
-    # 2. Reconstruction loss (in normalized DSD space)
-    pred_x_recon = model.decoder(Z)
-    loss_recon = divergence(
-        torch.log(pred_x_recon / (pred_x_recon.sum(dim=-1, keepdim=True) + params["tol"]) + params["tol"]),
-        torch.log(batch_x / (batch_x.sum(dim=-1, keepdim=True) + params["tol"]) + params["tol"]),
+    if "dgdt_cond" not in batch:
+        raise ValueError("dgdt_cond is required for the ERF condensation term")
+    dgdt_proj, rbin_median = _project_condensation_tendency(
+        model, latent, batch, params, device
     )
 
-    # 3. Compute dhdt from thermodynamics using the dhdt function
-    # This uses: condensation velocity, reconstructed DSD (de-normalized), and NWI prefactor
-    rbin_median = torch.from_numpy(params["rbin_median"]).to(device).float().reshape(1, 1, -1)
-    m_scale = params["m_scale"]
-    dhdt_computed = compute_dhdt(
-        Z, batch_temp, batch_sat, rbin_median,
-        model.encoder, model.decoder, m_scale=m_scale, use_kohler=False
-    )
+    # The file stores dgdt per ln(r). Convert it to the decoder representation:
+    # physical bin-mass tendency divided by M_scale.
+    dlnr = _dlnr_tensor(params, dgdt_proj)
+    batch_dgdt = batch["dgdt_cond"].unsqueeze(1) * dlnr / params["M_scale"]
 
-    # 4. Project dhdt to physical space using JVP
-    Z_detached = Z.clone().detach().requires_grad_(True)
-    _, dgdt_proj = torch.func.jvp(model.decoder, (Z_detached,), (dhdt_computed,))
-
-    # 5. Scale dgdt_proj to match batch_dgdt scaling
-    # dgdt_proj is scaled by m_scale (same as decoder output g)
-    # batch_dgdt is scaled by cond_scale
-    # Convert: (physical / m_scale) * (m_scale / cond_scale) = (physical / cond_scale)
-    m_scale = params["m_scale"]
-    cond_scale = params["cond_scale"]
-    dgdt_proj_scaled = dgdt_proj * m_scale / cond_scale
-
-    # 6. Condensation tendency loss (projected vs ERF ground truth, both scaled by cond_scale).
     # ERF's dgdt_cond is Lagrangian (mass gain of droplets in each bin); the projected
     # tendency is Eulerian, so convert the target unless the old behaviour is requested.
     if _cond_target_form(params) == "eulerian":
-        dlnr = float(torch.log(rbin_median[..., 1] / rbin_median[..., 0]).reshape(-1)[0])
-        batch_dgdt = eulerian_from_lagrangian(batch_dgdt, dlnr)
-    loss_cond_dx = mse(dgdt_proj_scaled, batch_dgdt)
+        uniform_dlnr = float(
+            torch.log(rbin_median[..., 1] / rbin_median[..., 0]).reshape(-1)[0]
+        )
+        batch_dgdt = eulerian_from_lagrangian(batch_dgdt, uniform_dlnr)
+    return mse(dgdt_proj, batch_dgdt)
 
-    # Weighted total loss
-    loss = (
-        params["loss_weight_recon"] * loss_recon
-        + params["loss_weight_cond_dx"] * loss_cond_dx
-    )
 
+def compute_condensation_loss_erf(model, batch, params, device):
+    """Combine reconstruction losses with the weighted ERF condensation term."""
+    latent, _, recon_losses = _reconstruction_losses(model, batch, params)
+    loss_recon = _weighted_reconstruction_loss(recon_losses, params)
+    erf_weight = params.get("loss_weight_cond_dx", 0.0)
+
+    # Allow reconstruction-only training without loading the ERF tendency.
+    if erf_weight == 0.0:
+        loss_cond_dx = loss_recon.new_zeros(())
+    else:
+        if "dgdt_cond" not in batch:
+            raise ValueError(
+                "dgdt_cond is required when loss_weight_cond_dx is nonzero"
+            )
+        loss_cond_dx = compute_condensation_erf_term(
+            model, batch, latent, params, device
+        )
+
+    loss = loss_recon + erf_weight * loss_cond_dx
     loss_dict = {
         "total": loss,
-        "recon": params["loss_weight_recon"] * loss_recon,
-        "cond_dx": params["loss_weight_cond_dx"] * loss_cond_dx,
+        "cond_dx": erf_weight * loss_cond_dx,
     }
+    loss_dict.update(_reconstruction_loss_dict(recon_losses, params))
 
     return loss, loss_dict
 
 
-def compute_condensation_loss_theory(model, batch, params, device):
-    """
-    Loss for condensation-aware autoencoder trained against theoretical condensation.
+def compute_condensation_theory_term(
+    model, batch, latent, reconstructed_mass, params, device
+):
+    """Return only the unweighted projected-vs-theory condensation MSE.
 
-    No dynamics model is trained. Instead, we compute dhdt from thermodynamics
-    using the dhdt function, project it through the decoder, and compare to
-    theoretical dgdt computed from the reconstructed DSD.
-
-    IMPORTANT: Theoretical condensation must be computed in PHYSICAL (de-normalized) space,
-    not normalized space, because the thermodynamic equations require actual kg/m³ units.
+    The theoretical tendency is evaluated in physical units and converted back
+    to the model's scaled bin-mass representation before comparison. This term
+    does not compute or combine reconstruction losses and applies no weight.
 
     Args:
-        model: ComposedModel with encoder and decoder (no dynamics)
-        batch: Tuple of (batch_x, batch_dgdt, batch_temp, batch_sat, batch_m)
-               - batch_x: normalized DSD [batch, 1, n_bins] (divided by m_scale)
-               - batch_dgdt: target condensation tendency (not used in theory variant)
-               - batch_temp: temperature [batch, 1, 1] in Kelvin
-               - batch_sat: saturation ratio [batch, 1, 1] (dimensionless)
-               - batch_m: normalized total mass [batch, 1, 1] (divided by m_scale)
-        params: Parameters dict with loss weights, 'rbin_median', 'm_scale', 'cond_scale'
-        device: Compute device
+        model: Composed model with encoder and mass decoder.
+        batch: Dictionary batch from ``AllProcessesDataset``.
+        latent: Previously computed state ``[Z, M]`` or ``[Z, M, N]``.
+        reconstructed_mass: Previously decoded scaled mass-bin amounts.
+        params: Parameters containing ``rbin_median``, ``dlnr``, and ``M_scale``.
+        device: Compute device.
 
     Returns:
-        total_loss, loss_dict
+        Scalar, unweighted condensation tendency MSE.
     """
-    batch_x, batch_dgdt, batch_temp, batch_sat, batch_m = batch
-
-    # 1. Encode DSD to latent space
-    Z = model.encoder(batch_x)
-
-    # 2. Reconstruction loss (in normalized DSD space)
-    pred_x_recon = model.decoder(Z)
-    loss_recon = divergence(
-        torch.log(pred_x_recon / (pred_x_recon.sum(dim=-1, keepdim=True) + params["tol"]) + params["tol"]),
-        torch.log(batch_x / (batch_x.sum(dim=-1, keepdim=True) + params["tol"]) + params["tol"]),
+    batch_temp = batch["temp"].reshape(-1, 1, 1)
+    batch_sat = batch["rh"].reshape(-1, 1, 1)
+    dgdt_proj, rbin_median = _project_condensation_tendency(
+        model, latent, batch, params, device
     )
 
-    # 3. Compute dhdt from thermodynamics using the dhdt function, in scaled mass units
-    # This uses: condensation velocity, reconstructed DSD (de-normalized), and NWI prefactor
-    rbin_median = torch.from_numpy(params["rbin_median"]).to(device).float().reshape(1, 1, -1)
-    m_scale = params["m_scale"]
-    dhdt_computed = compute_dhdt(
-        Z, batch_temp, batch_sat, rbin_median,
-        model.encoder, model.decoder, m_scale=m_scale, use_kohler=False
-    )
-
-    # 4. Project dhdt to scaled physical space using JVP
-    Z_detached = Z.clone().detach().requires_grad_(True)
-    _, dgdt_proj = torch.func.jvp(model.decoder, (Z_detached,), (dhdt_computed,))
-
-    # 5. Compute the theoretical rate of condensation in scaled mass units
-    dgdt_theory = compute_theoretical_condensation(
-        pred_x_recon, batch_temp, batch_sat, rbin_median, use_kohler=False,
+    # Evaluate theory in physical units. The model reconstructs scaled bin
+    # mass, x = dmdlnr * dlnr / M_scale. Condensation theory requires
+    # physical dmdlnr [kg m-3 per ln(r)], so convert before evaluating it and
+    # convert the result back to the decoder/JVP representation afterwards.
+    dlnr = _dlnr_tensor(params, reconstructed_mass)
+    dmdlnr_physical = reconstructed_mass * params["M_scale"] / dlnr
+    dgdt_theory_physical = compute_theoretical_condensation(
+        dmdlnr_physical,
+        batch_temp,
+        batch_sat,
+        rbin_median,
+        use_kohler=False,
         form=_cond_target_form(params),
-        scheme=params.get("cond_theory_scheme", "central"),  # decoder output is smooth
+        scheme=params.get("cond_theory_scheme", "central"),
     )
+    dgdt_theory = dgdt_theory_physical * dlnr / params["M_scale"]
+    return mse(dgdt_proj, dgdt_theory)
 
-    # 6. Condensation tendency loss: projected vs theoretical with scaled mass units 
-    # Scale by cond_scale to be consistent with ERF loss term
-    loss_cond_dx = mse(dgdt_proj, dgdt_theory) / params["cond_scale"]**2 * params["m_scale"]**2
 
-    # Weighted total loss
-    loss = (
-        params["loss_weight_recon"] * loss_recon
-        + params["loss_weight_cond_dx"] * loss_cond_dx
+def compute_condensation_loss_theory(model, batch, params, device):
+    """Combine reconstruction losses with the weighted theory condensation term."""
+    latent, reconstructed_mass, recon_losses = _reconstruction_losses(
+        model, batch, params
     )
+    loss_recon = _weighted_reconstruction_loss(recon_losses, params)
+    theory_weight = params.get("loss_weight_cond_dx", 0.0)
 
+    if theory_weight == 0.0:
+        loss_cond_dx = loss_recon.new_zeros(())
+    else:
+        loss_cond_dx = compute_condensation_theory_term(
+            model, batch, latent, reconstructed_mass, params, device
+        )
+
+    loss = loss_recon + theory_weight * loss_cond_dx
     loss_dict = {
         "total": loss,
-        "recon": params["loss_weight_recon"] * loss_recon,
-        "cond_dx": params["loss_weight_cond_dx"] * loss_cond_dx,
+        "cond_dx": theory_weight * loss_cond_dx,
     }
+    loss_dict.update(_reconstruction_loss_dict(recon_losses, params))
 
     return loss, loss_dict
 
@@ -186,31 +196,16 @@ def compute_autoencoder_loss(model, batch, params, device):
 
     Args:
         model: ComposedModel with encoder and decoder only
-        batch: Tuple of (batch_x, batch_dgdt, batch_temp, batch_sat, batch_m)
-               Only batch_x is used
+        batch: Dictionary batch from ``AllProcessesDataset``.
         params: Parameters dict with loss weights
         device: Compute device
 
     Returns:
         total_loss, loss_dict
     """
-    batch_x, batch_dgdt, batch_temp, batch_sat, batch_m = batch
-
-    # Forward pass for reconstruction
-    pred_x_recon = model.decoder(model.encoder(batch_x))
-
-    # Reconstruction loss in normalized space for KL divergence
-    loss_recon = divergence(
-        torch.log(pred_x_recon / (pred_x_recon.sum(dim=-1, keepdim=True) + params["tol"]) + params["tol"]),
-        torch.log(batch_x / (batch_x.sum(dim=-1, keepdim=True) + params["tol"]) + params["tol"]),
-    )
-
-    loss = loss_recon
-
-    loss_dict = {
-        "total": loss,
-        "recon": loss_recon,
-    }
+    _, _, recon_losses = _reconstruction_losses(model, batch, params)
+    loss = _weighted_reconstruction_loss(recon_losses, params)
+    loss_dict = {"total": loss, **_reconstruction_loss_dict(recon_losses, params)}
 
     return loss, loss_dict
 

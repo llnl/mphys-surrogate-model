@@ -5,6 +5,7 @@ Provides generic training loop, device setup, data loading, and optimization set
 
 import copy
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,19 @@ from torch.utils.data import DataLoader
 
 from src import data_utils as du
 from src import diagnostics
+
+
+def move_batch_to_device(batch, device):
+    """Recursively move tensor batches, including dictionary batches."""
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device)
+    if isinstance(batch, Mapping):
+        return {key: move_batch_to_device(value, device) for key, value in batch.items()}
+    if isinstance(batch, tuple):
+        return tuple(move_batch_to_device(value, device) for value in batch)
+    if isinstance(batch, list):
+        return [move_batch_to_device(value, device) for value in batch]
+    return batch
 
 
 def setup_device(params=None, allow_mps=False, batch_size=None):
@@ -402,7 +416,7 @@ def train_and_eval(
 
         for batch in train_loader:
             # Move batch to device
-            batch = tuple(b.to(device) if isinstance(b, torch.Tensor) else b for b in batch)
+            batch = move_batch_to_device(batch, device)
 
             # Forward pass and loss computation
             loss, loss_dict = loss_fn(model, batch, params, device)
@@ -428,7 +442,7 @@ def train_and_eval(
         model.eval()
         with torch.no_grad():
             for batch in test_loader:
-                batch = tuple(b.to(device) if isinstance(b, torch.Tensor) else b for b in batch)
+                batch = move_batch_to_device(batch, device)
                 test_loss, test_loss_dict = loss_fn(model, batch, params, device)
 
         # Store test losses

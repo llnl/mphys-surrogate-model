@@ -146,6 +146,8 @@ def save_model_artifacts(model, losses, params, output_dir, timestamp):
             params_save[key] = float(value)
         elif isinstance(value, (np.int32, np.int64)):
             params_save[key] = int(value)
+        elif isinstance(value, np.ndarray):
+            params_save[key] = value.tolist()
 
     params_file = output_dir / "params.json"
     params_file.write_text(json.dumps(params_save, indent=4))
